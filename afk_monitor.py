@@ -28,6 +28,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+# ==================== 报错日志模块 ====================
+try:
+    from error_logger import setup_error_logging, shutdown_error_logging, get_log_file_path
+except ImportError:
+    setup_error_logging = None
+    shutdown_error_logging = None
+    get_log_file_path = None
+
 # ==================== 日志配置 ====================
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
 LOG_DATE_FORMAT = '%H:%M:%S'
@@ -976,6 +984,16 @@ class MonitorApp:
 
 # ==================== 入口 ====================
 def main() -> None:
+    # 初始化全局报错日志（在参数解析前初始化以确保捕获所有阶段的异常）
+    _error_log_path = None
+    try:
+        if setup_error_logging:
+            _error_log_path = setup_error_logging()
+            if _error_log_path:
+                log.info(f"报错日志系统已启动，日志文件: {_error_log_path}")
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Minecraft AFK 挂机互保脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1120,7 +1138,15 @@ def main() -> None:
 
     # 启动主程序
     app = MonitorApp(config, target_pid)
-    app.run()
+    try:
+        app.run()
+    finally:
+        # 关闭报错日志系统
+        if shutdown_error_logging:
+            try:
+                shutdown_error_logging()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

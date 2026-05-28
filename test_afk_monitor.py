@@ -8,6 +8,7 @@ Minecraft AFK 挂机互保脚本 - 单元测试
 
 import json
 import io
+import os
 import socket
 import sys
 import tempfile
@@ -20,7 +21,23 @@ from unittest.mock import MagicMock, patch, call
 # 添加当前目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+# ==================== 报错日志初始化 ====================
+try:
+    from error_logger import setup_error_logging, shutdown_error_logging
+    setup_error_logging()
+except ImportError:
+    pass
+
 import afk_monitor
+
+
+# ==================== 测试结束后清理 ====================
+def tearDownModule():
+    try:
+        from error_logger import shutdown_error_logging
+        shutdown_error_logging()
+    except ImportError:
+        pass
 
 
 class TestProtocolMessage(unittest.TestCase):
