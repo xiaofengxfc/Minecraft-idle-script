@@ -23,6 +23,7 @@ import argparse
 import subprocess
 import logging
 from datetime import datetime
+from typing import List, Tuple, Optional
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -63,6 +64,145 @@ RECONNECT_INTERVAL = 5        # 连接重试间隔（秒）
 LOCALHOST = "127.0.0.1"       # 仅监听本地回环地址，保证纯本地通信
 
 HEARTBEAT_MSG = b"ALIVE\n"    # 心跳消息
+
+# ==================== Minecraft 进程自动检测 ====================
+def find_minecraft_processes() -> List[Tuple[int, str, str]]:
+    """
+    扫描系统中所有正在运行的 Minecraft Java 进程。
+    
+    Returns:
+        List of (pid, process_name, command_line) tuples.
+        Returns empty list if none found.
+    匹配规则：
+        - 进程名包含 javaw.exe / java.exe / minecraft
+        - 命令行参数包含 minecraft 或 forge/fabric/optifine 等启动器特征
+    """
+    minecraft_processes = []
+    
+    # Minecraft 相关的命令行特征关键字
+    mc_keywords = [
+        'minecraft', 'forge', 'fabric', 'nide8auth', 'authlib-injector',
+        'launcher', 'LaunchClient', '-Dminecraft', 'lwjgl',
+        'tlauncher', 'hmcl', 'pcl', 'bakaxl', 'plaincraft',
+        'launchwrapper'
+    ]
+    
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            info = proc.info
+            name = info.get('name', '').lower() if info.get('name') else ''
+            pid = info.get('pid')
+            cmdline = ' '.join(info.get('cmdline', [])) if info.get('cmdline') else ''
+            cmdline_lower = cmdline.lower()
+            
+            # 检查进程名特征
+            is_java_process = (
+                'java' in name or 
+                'javaw' in name or 
+                'minecraft' in name
+            )
+            
+            if not is_java_process:
+                continue
+            
+            # 检查命令行是否包含 Minecraft 相关特征
+            is_minecraft = any(keyword.lower() in cmdline_lower for keyword in mc_keywords)
+            
+            if is_minecraft:
+                # 尝试提取更友好的描述
+                display_name = name
+                if 'minecraft' in cmdline_lower:
+                    display_name = f"{name} [Minecraft]"
+                elif any(k in cmdline_lower for k in ['forge', 'fabric']):
+                    display_name = f"{name} [Modded MC]"
+                else:
+                    display_name = f"{name} [MC Launcher]"
+                
+                minecraft_processes.append((pid, display_name, cmdline))
+                
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    
+    return minecraft_processes
+
+
+def interactive_select_minecraft_process(
+    processes: List[Tuple[int, str, str]],
+    allow_multi: bool = False,
+    default_pids: Optional[List[int]] = None
+) -> Optional[List[int]]:
+    """
+    交互式选择一个或多个 Minecraft 进程。
+    
+    Args:
+        processes: find_minecraft_processes() 返回的进程列表
+        allow_multi: 是否允许多选（用于启动两个实例时）
+        default_pids: 如果提供了默认 PID 列表，且它们都在 processes 中，自动选择
+        
+    Returns:
+        选中的 PID 列表，如果用户取消则返回 None
+    """
+    if not processes:
+        return None
+    
+    # 如果有默认 PID 且它们在进程列表中，自动选择
+    if default_pids:
+        available_pids = {p[0] for p in processes}
+        matched_pids = [pid for pid in default_pids if pid in available_pids]
+        if matched_pids:
+            log.info(f"自动匹配到指定的 Minecraft 进程 PID: {matched_pids}")
+            return matched_pids
+    
+    print("\n" + "=" * 60)
+    print("检测到以下 Minecraft 进程:")
+    print("=" * 60)
+    for i, (pid, name, cmdline) in enumerate(processes, 1):
+        # 截断命令行以保持可读性
+        cmd_display = cmdline[:120] + "..." if len(cmdline) > 120 else cmdline
+        print(f"  [{i}] PID: {pid:<8} | {name}")
+        print(f"      命令行: {cmd_display}")
+        print()
+    
+    if allow_multi:
+        print(f"选项: 输入编号选择 (如 '1' '2' 各选一个)，或输入 'all' 选择全部")
+        print(f"      输入 'q' 退出")
+    else:
+        print(f"选项: 输入编号选择 (1-{len(processes)})，或输入 'q' 退出")
+    
+    while True:
+        try:
+            choice = input("\n请选择: ").strip().lower()
+            
+            if choice == 'q':
+                return None
+            
+            if choice == 'all' and allow_multi:
+                return [p[0] for p in processes]
+            
+            # 解析编号
+            indices = [int(x.strip()) for x in choice.replace(',', ' ').split()]
+            
+            if not indices:
+                print("输入无效，请重新输入")
+                continue
+            
+            selected_pids = []
+            for idx in indices:
+                if 1 <= idx <= len(processes):
+                    selected_pids.append(processes[idx - 1][0])
+                else:
+                    print(f"编号 {idx} 超出范围 (1-{len(processes)})")
+                    break
+            else:
+                if selected_pids:
+                    return selected_pids
+                    
+        except (ValueError, KeyboardInterrupt):
+            if isinstance(choice, KeyboardInterrupt):
+                return None
+            print("输入无效，请输入数字编号")
+    
+    return None
 
 
 # ==================== 进程管理 ====================
@@ -362,8 +502,16 @@ def main():
         help="对方实例监听的端口号"
     )
     parser.add_argument(
-        "--pid", type=int, required=True,
-        help="要监控的 Minecraft 客户端进程 PID"
+        "--pid", type=int, required=False, default=None,
+        help="要监控的 Minecraft 客户端进程 PID（与 --auto 互斥，但可同时指定用于自动匹配）"
+    )
+    parser.add_argument(
+        "--auto", action="store_true", default=False,
+        help="自动检测 Minecraft 进程（无需手动指定 PID）"
+    )
+    parser.add_argument(
+        "--list", action="store_true", default=False,
+        help="列出所有检测到的 Minecraft 进程后退出"
     )
     parser.add_argument(
         "--heartbeat-interval", type=int, default=HEARTBEAT_INTERVAL,
@@ -380,14 +528,65 @@ def main():
     HEARTBEAT_INTERVAL = args.heartbeat_interval
     HEARTBEAT_TIMEOUT = args.heartbeat_timeout
 
+    # ==================== PID 处理逻辑 ====================
+    target_pid = args.pid
+    
+    # --list 模式：列出所有 Minecraft 进程后退出
+    if args.list:
+        processes = find_minecraft_processes()
+        if not processes:
+            print("未检测到任何 Minecraft 进程。")
+        else:
+            print("\n" + "=" * 60)
+            print(f"检测到 {len(processes)} 个 Minecraft 进程:")
+            print("=" * 60)
+            for pid, name, cmdline in processes:
+                cmd_display = cmdline[:150] + "..." if len(cmdline) > 150 else cmdline
+                print(f"  PID: {pid:<8} | {name}")
+                print(f"  命令行: {cmd_display}")
+                print()
+        sys.exit(0)
+    
+    # 自动检测模式
+    if args.auto or target_pid is None:
+        log.info("启用自动检测模式，正在扫描 Minecraft 进程...")
+        processes = find_minecraft_processes()
+        
+        if not processes:
+            log.error("未检测到任何 Minecraft 进程！")
+            log.error("请确保 Minecraft 客户端已启动，或使用 --pid 手动指定 PID。")
+            log.error("提示: 可使用 --list 查看所有已检测到的进程。")
+            sys.exit(1)
+        
+        log.info(f"检测到 {len(processes)} 个 Minecraft 进程")
+        
+        # 如果用户同时指定了 --pid，尝试自动匹配
+        selected_pids = None
+        if target_pid is not None:
+            selected_pids = interactive_select_minecraft_process(
+                processes, allow_multi=False, default_pids=[target_pid]
+            )
+        else:
+            # 纯自动模式：交互式选择（单个进程）
+            selected_pids = interactive_select_minecraft_process(
+                processes, allow_multi=False
+            )
+        
+        if not selected_pids:
+            log.error("未选择任何进程，退出。")
+            sys.exit(1)
+        
+        target_pid = selected_pids[0]
+    
     # 验证 PID 是否有效
-    if not check_process_alive(args.pid):
-        log.error(f"指定的进程 PID {args.pid} 不存在或无法访问！")
+    if not check_process_alive(target_pid):
+        log.error(f"指定的进程 PID {target_pid} 不存在或无法访问！")
         log.error("请确认 PID 是否正确，进程是否正在运行。")
+        log.error("提示: 可使用 --list 查看当前所有 Minecraft 进程。")
         sys.exit(1)
 
-    proc = psutil.Process(args.pid)
-    log.info(f"监控进程: {proc.name()} (PID: {args.pid})")
+    proc = psutil.Process(target_pid)
+    log.info(f"监控进程: {proc.name()} (PID: {target_pid})")
     log.info(f"心跳间隔: {HEARTBEAT_INTERVAL}s, 超时: {HEARTBEAT_TIMEOUT}s")
 
     # ==================== 掉线处理回调 ====================
@@ -395,9 +594,9 @@ def main():
         """对方掉线时的处理：终止本地 Minecraft 进程"""
         log.warning("=" * 50)
         log.warning("检测到对方客户端掉线！")
-        log.warning(f"正在结束本地 Minecraft 进程 (PID: {args.pid}) ...")
+        log.warning(f"正在结束本地 Minecraft 进程 (PID: {target_pid}) ...")
         log.warning("=" * 50)
-        kill_process(args.pid)
+        kill_process(target_pid)
         log.info("本地 Minecraft 进程已结束，脚本即将退出。")
         os._exit(0)  # 强制退出，不等待线程
 
@@ -405,7 +604,7 @@ def main():
     peer = PeerConnection(
         port=args.port,
         peer_port=args.peer_port,
-        monitored_pid=args.pid,
+        monitored_pid=target_pid,
         on_peer_lost=on_peer_lost
     )
 
