@@ -194,8 +194,9 @@ class PeerConnection:
     - 双方各自作为 Client 去连接对方端口
     - 任意一条 TCP 连接建立后，在该连接上进行双向心跳收发
     - 发送线程定期发送 HEARTBEAT_MSG，接收线程持续读取并刷新 last_heartbeat
-    - 任意方向检测到连接断开时立即触发 on_peer_lost，不等心跳超时
-    - 心跳超时作为最终兜底机制
+    - TCP 连接断开时只清理连接，由 Client 重连机制自动恢复
+    - 心跳超时（默认 15s 收不到心跳）作为唯一判定对方掉线的机制
+    - 启动宽限期（默认 90s）内不因连接失败/心跳超时判定掉线
     """
 
     def __init__(self, port, peer_port, monitored_pid, on_peer_lost):
@@ -245,7 +246,7 @@ class PeerConnection:
     def _trigger_peer_lost(self, reason: str = ""):
         """
         线程安全地触发 on_peer_lost，确保只执行一次。
-        当 TCP 连接断开时（收/发失败或对端主动关闭），立即触发，不等心跳超时。
+        由心跳超时检测器调用（连续15秒未收到心跳时），是判定对方掉线的唯一入口。
         """
         with self._conn_lock:
             if self._peer_lost_triggered:
@@ -282,15 +283,17 @@ class PeerConnection:
                 except Exception:
                     break
                 time.sleep(HEARTBEAT_INTERVAL)
-            # 发送失败，立即触发掉线处理（不等心跳超时）
+            # 发送失败，清理连接，由心跳超时检测器最终判定是否掉线
             log.debug(f"[{role_name}] 发送线程退出")
             self._clear_active_socket(sock)
             try:
                 sock.close()
             except Exception:
                 pass
+            # 不立即判定对方掉线！交由 _heartbeat_checker 超时机制兜底
+            # 在此期间 client 重连机制会尝试恢复连接
             if self.running and not self._peer_lost_triggered:
-                self._trigger_peer_lost(f"{role_name} 侧发送连接断开")
+                log.info(f"[{role_name}] TCP 发送连接断开，将尝试重新连接...")
 
         def recv_loop():
             try:
@@ -314,15 +317,17 @@ class PeerConnection:
                     break
                 except Exception:
                     break
-            # 接收失败或连接断开，立即触发掉线处理（不等心跳超时）
+            # 接收失败或连接断开，清理连接，由心跳超时检测器最终判定是否掉线
             log.debug(f"[{role_name}] 接收线程退出")
             self._clear_active_socket(sock)
             try:
                 sock.close()
             except Exception:
                 pass
+            # 不立即判定对方掉线！交由 _heartbeat_checker 超时机制兜底
+            # 在此期间 client 重连机制会尝试恢复连接
             if self.running and not self._peer_lost_triggered:
-                self._trigger_peer_lost(f"{role_name} 侧接收连接断开")
+                log.info(f"[{role_name}] TCP 接收连接断开，将尝试重新连接...")
 
         threading.Thread(target=send_loop, daemon=True,
                          name=f"HBSend-{role_name}").start()
@@ -381,6 +386,8 @@ class PeerConnection:
                             time.sleep(HEARTBEAT_INTERVAL)
                             continue
                     break
+                # 连接断开，重置退避时间以快速重连
+                backoff = RECONNECT_INTERVAL_MIN
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
                 elapsed = time.time() - self.startup_time
                 if elapsed < STARTUP_GRACE_PERIOD:
@@ -389,7 +396,6 @@ class PeerConnection:
                              f"宽限期剩余 {STARTUP_GRACE_PERIOD - int(elapsed)}s)")
                 else:
                     log.warning(f"连接对方失败 ({LOCALHOST}:{self.peer_port}): {e}")
-                backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
                 log.info(f"{backoff}秒后重试...")
             finally:
                 if sock:
@@ -401,9 +407,9 @@ class PeerConnection:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
 
-    # ---------- 超时检测（兜底机制）----------
+    # ---------- 超时检测（唯一判定机制）----------
     def _heartbeat_checker(self):
-        """心跳超时作为最终兜底，正常情况由 recv/send 线程直接触发"""
+        """心跳超时是判定对方掉线的唯一机制，TCP 连接断开不会直接触发杀进程"""
         while self.running and not self._peer_lost_triggered:
             time.sleep(1)
             elapsed = time.time() - self.last_heartbeat
