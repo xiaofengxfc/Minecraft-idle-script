@@ -127,23 +127,68 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
 
 
 # ==================== 服务器连接检测 ====================
+
+# 非 Minecraft 游戏服务器的常见端口（认证/API/CDN/Web）
+# 这些端口上的连接通常不是游戏服务器连接，应予以排除
+_NON_GAME_PORTS = {
+    80, 443, 8080, 8443,  # HTTP/HTTPS
+    21, 22, 23,            # FTP/SSH/Telnet
+    53,                    # DNS
+    110, 143, 993, 995,   # POP3/IMAP
+    25, 465, 587,          # SMTP
+}
+
+# Minecraft 默认端口及常见范围
+_MC_DEFAULT_PORT = 25565
+_MC_COMMON_PORT_RANGE = range(10000, 60000)  # 常见服务器端口范围
+
+
+def _is_likely_game_port(port: int) -> bool:
+    """
+    判断端口是否可能是 Minecraft 游戏服务器端口。
+    
+    排除常见的 Web/API/CDN 端口（如 443, 80），保留游戏常用的高端口。
+    """
+    if port in _NON_GAME_PORTS:
+        return False
+    # Minecraft 默认端口直接通过
+    if port == _MC_DEFAULT_PORT:
+        return True
+    # 高端口范围内认为可能是游戏服务器
+    if port >= 1024:
+        return True
+    return False
+
+
 def get_minecraft_server_connection(pid: int) -> Optional[Tuple[str, int]]:
-    """获取 Minecraft 进程的主服务器连接（排除本地回环）"""
+    """
+    获取 Minecraft 进程的主游戏服务器连接（排除本地回环和非游戏端口）。
+    
+    过滤策略：
+    1. 排除本地回环地址
+    2. 排除常见的非游戏端口（443/80 等认证/API 端口）
+    3. 优先返回可能是 Minecraft 游戏服务器的连接
+    """
     try:
+        # 第一轮：查找明确是游戏端口的连接（排除 443/80 等）
         for conn in psutil.Process(pid).net_connections(kind='tcp'):
             if conn.status != 'ESTABLISHED' or not conn.raddr:
                 continue
             ip = conn.raddr.ip
             if ip.startswith('127.') or ip in ('::1', '0.0.0.0'):
                 continue
-            return (ip, conn.raddr.port)
+            if _is_likely_game_port(conn.raddr.port):
+                return (ip, conn.raddr.port)
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         pass
     return None
 
 
 def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
-    """获取所有远程服务器连接"""
+    """
+    获取所有远程连接（排除本地回环）。
+    返回全部连接，包括非游戏端口，用于日志展示。
+    """
     result = []
     try:
         for conn in psutil.Process(pid).net_connections(kind='tcp'):
@@ -155,6 +200,82 @@ def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
             result.append((ip, conn.raddr.port))
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         pass
+    return result
+
+
+def get_server_connections_fallback(pid: int) -> List[Tuple[str, int]]:
+    """
+    备用方案：通过 netstat 命令获取 TCP 连接（当 psutil 权限不足时使用）。
+    
+    在 Windows 上，netstat -ano 不需要管理员权限即可列出 TCP 连接。
+    返回 (remote_ip, remote_port) 列表。
+    
+    netstat -ano 输出格式 (中文/英文系统通用):
+      TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234
+      TCP    192.168.1.100:54321    180.188.16.62:10111    ESTABLISHED     8796
+    """
+    result = []
+    try:
+        output = subprocess.check_output(
+            ["netstat", "-ano"], timeout=5,
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8', errors='replace')
+    except Exception:
+        return result
+    
+    pid_str = str(pid)
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not line.endswith(pid_str):
+            continue
+        
+        # 检查是否包含 ESTABLISHED 状态
+        if 'ESTABLISHED' not in line.upper():
+            continue
+        
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        
+        # netstat -ano 格式: Proto  LocalAddress  ForeignAddress  State  PID
+        # parts[0]=TCP, parts[1]=本地地址, parts[2]=远程地址, parts[3]=状态, parts[4]=PID
+        foreign = parts[2]
+        
+        if ':' not in foreign:
+            continue
+        
+        try:
+            # 解析 IP:Port
+            ip_port = str(foreign)
+            
+            # 处理 IPv6 方括号格式: [::1]:port
+            if ip_port.startswith('['):
+                bracket_end = ip_port.rfind(']')
+                if bracket_end > 0 and ':' in ip_port[bracket_end:]:
+                    ip = ip_port[:bracket_end + 1]
+                    port_str = ip_port[bracket_end + 2:]
+                else:
+                    continue
+            else:
+                # IPv4 格式: 192.168.1.1:port
+                last_colon = ip_port.rfind(':')
+                if last_colon <= 0:
+                    continue
+                ip = ip_port[:last_colon]
+                port_str = ip_port[last_colon + 1:]
+            
+            port = int(port_str)
+            
+            # 排除本地回环
+            if ip in ('127.0.0.1', '::1', '0.0.0.0', '[::1]'):
+                continue
+            if ip.startswith('127.'):
+                continue
+            
+            result.append((ip, port))
+        except (ValueError, IndexError):
+            continue
+    
     return result
 
 
@@ -719,14 +840,15 @@ def main():
     log.info("正在检测客户端服务器连接状态...")
     srv = get_minecraft_server_connection(target_pid)
     if srv:
-        log.info(f"✓ 已连接至服务器: {srv[0]}:{srv[1]}")
+        log.info(f"✓ 已连接至游戏服务器: {srv[0]}:{srv[1]}")
     else:
-        log.warning("✗ 当前未连接至远程服务器")
+        log.warning("✗ 当前未检测到游戏服务器连接")
     all_c = get_all_server_connections(target_pid)
-    if len(all_c) > 1:
-        log.info(f"  检测到 {len(all_c)} 个远程连接:")
+    if all_c:
+        log.info(f"  检测到 {len(all_c)} 个远程连接（含认证/API 等）:")
         for ip, port in all_c:
-            log.info(f"    - {ip}:{port}")
+            tag = " [游戏]" if _is_likely_game_port(port) else " [非游戏]"
+            log.info(f"    - {ip}:{port}{tag}")
     log.info("-" * 40)
     if args.no_check_server:
         log.info("服务器连接检测已禁用 (使用 --no-check-server 禁用)")
@@ -775,16 +897,70 @@ def main():
 
     # ========== 服务器连接监控（默认启用）==========
     if not args.no_check_server:
+        _psutil_permission_warned = [False]  # 用列表包装以支持闭包修改
+        
+        def _check_server_connection_with_fallback(pid):
+            """
+            多级检测服务器连接状态：
+            1. 优先使用 psutil（带游戏端口过滤）
+            2. psutil 权限不足时回退到 netstat 命令
+            3. 两者都失败时记录警告但不误判
+            """
+            # 第一级：psutil + 端口过滤
+            result = get_minecraft_server_connection(pid)
+            if result is not None:
+                return result
+            
+            # 检查是否是 psutil 权限问题（AccessDenied 导致空结果）
+            # 通过尝试获取进程列表来判断是否完全无权限
+            try:
+                all_conns = get_all_server_connections(pid)
+                # 如果 psutil 能获取到连接列表但经过滤后为空，说明确实没有游戏连接
+                # 但如果 psutil 返回空列表（可能权限不足），需要 netstat 验证
+                if len(all_conns) > 0:
+                    # psutil 能正常获取连接，只是没有游戏端口连接 → 确实断开了
+                    return None
+            except Exception:
+                pass
+            
+            # 第二级：netstat 回退方案（Windows 普通用户可用）
+            if not _psutil_permission_warned[0]:
+                log.info("[服务器检测] psutil 连接检测权限不足，启用 netstat 备用方案")
+                _psutil_permission_warned[0] = True
+            
+            fallback = get_server_connections_fallback(pid)
+            for ip, port in fallback:
+                if _is_likely_game_port(port):
+                    return (ip, port)
+            
+            # netstat 也查不到游戏连接 → 确认断开
+            return None
+        
         def server_monitor(pid, interval, peer_obj, cb):
             log.info(f"[服务器检测] 监控线程已启动 (PID: {pid}, 间隔: {interval}s)")
+            consecutive_disconnects = 0  # 连续断开计数，防止误判
+            max_consecutive = 2          # 连续2次检测到断开才确认
+            
             while peer_obj.running:
                 time.sleep(interval)
                 if not check_process_alive(pid):
                     break
-                if get_minecraft_server_connection(pid) is None:
-                    log.warning(f"[服务器检测] 客户端已断开服务器连接 (PID: {pid})")
-                    cb()
-                    break
+                
+                srv = _check_server_connection_with_fallback(pid)
+                if srv is None:
+                    consecutive_disconnects += 1
+                    log.warning(
+                        f"[服务器检测] 未检测到游戏服务器连接 "
+                        f"({consecutive_disconnects}/{max_consecutive}) (PID: {pid})"
+                    )
+                    if consecutive_disconnects >= max_consecutive:
+                        log.warning(f"[服务器检测] 客户端已断开服务器连接 (PID: {pid})")
+                        cb()
+                        break
+                else:
+                    if consecutive_disconnects > 0:
+                        log.info(f"[服务器检测] 服务器连接已恢复: {srv[0]}:{srv[1]}")
+                    consecutive_disconnects = 0
 
         threading.Thread(
             target=server_monitor,
