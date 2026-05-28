@@ -116,7 +116,7 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
 def get_minecraft_server_connection(pid: int) -> Optional[Tuple[str, int]]:
     """获取 Minecraft 进程的主服务器连接（排除本地回环）"""
     try:
-        for conn in psutil.Process(pid).connections(kind='tcp'):
+        for conn in psutil.Process(pid).net_connections(kind='tcp'):
             if conn.status != 'ESTABLISHED' or not conn.raddr:
                 continue
             ip = conn.raddr.ip
@@ -132,7 +132,7 @@ def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
     """获取所有远程服务器连接"""
     result = []
     try:
-        for conn in psutil.Process(pid).connections(kind='tcp'):
+        for conn in psutil.Process(pid).net_connections(kind='tcp'):
             if conn.status != 'ESTABLISHED' or not conn.raddr:
                 continue
             ip = conn.raddr.ip
@@ -193,6 +193,8 @@ class PeerConnection:
         self.server_socket = None
         self.client_socket = None
         self.last_heartbeat = time.time()
+        self.startup_time = time.time()
+        self.peer_ever_connected = False
         self.running = True
         self.lock = threading.Lock()
 
@@ -264,6 +266,7 @@ class PeerConnection:
                     self.server_socket = None
 
     def _handle_incoming(self, conn):
+        self.peer_ever_connected = True
         conn.settimeout(HEARTBEAT_INTERVAL + 2)
         while self.running:
             try:
@@ -291,6 +294,9 @@ class PeerConnection:
                 sock.settimeout(5)
                 sock.connect((LOCALHOST, self.peer_port))
                 log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port}")
+                self.peer_ever_connected = True
+                # 连接成功后重置心跳时间，给对方一点时间建立反向连接
+                self.last_heartbeat = time.time()
                 with self.lock:
                     self.client_socket = sock
                 while self.running:
@@ -316,10 +322,17 @@ class PeerConnection:
                     time.sleep(RECONNECT_INTERVAL)
 
     def _heartbeat_checker(self):
+        # 启动宽限期：60秒内即使从未连接也不判定超时，给另一实例足够启动时间
+        STARTUP_GRACE_PERIOD = 60
         while self.running:
             time.sleep(1)
             elapsed = time.time() - self.last_heartbeat
+            since_startup = time.time() - self.startup_time
             if elapsed > HEARTBEAT_TIMEOUT:
+                # 启动宽限期内且从未连接过对方：等待而非判定超时
+                if since_startup < STARTUP_GRACE_PERIOD and not self.peer_ever_connected:
+                    log.info(f"[{int(since_startup)}s] 等待对方实例启动中... (宽限期剩余 {STARTUP_GRACE_PERIOD - int(since_startup)}s)")
+                    continue
                 log.error(f"心跳超时！已 {elapsed:.0f} 秒未收到对方心跳")
                 log.error("对方已掉线，正在结束本地 Minecraft 客户端...")
                 self.on_peer_lost()
@@ -348,9 +361,9 @@ def main():
   实例A: python afk_monitor.py --port 18888 --peer-port 18889 --auto --auto-index 0
   实例B: python afk_monitor.py --port 18889 --peer-port 18888 --auto --auto-index 1
   手动:  python afk_monitor.py --port 18888 --peer-port 18889 --pid <PID>""")
-    parser.add_argument("--port", type=int, required=True,
+    parser.add_argument("--port", type=int, default=None,
                         help="本实例监听端口号")
-    parser.add_argument("--peer-port", type=int, required=True,
+    parser.add_argument("--peer-port", type=int, default=None,
                         help="对方实例监听端口号")
     parser.add_argument("--pid", type=int, default=None,
                         help="手动指定 Minecraft 进程 PID")
@@ -373,7 +386,7 @@ def main():
     HEARTBEAT_INTERVAL = args.heartbeat_interval
     HEARTBEAT_TIMEOUT = args.heartbeat_timeout
 
-    # --list 模式
+    # --list 模式（不需要 port 和 peer-port）
     if args.list:
         processes = find_minecraft_processes()
         if not processes:
@@ -386,6 +399,12 @@ def main():
                 print(f"  PID: {pid:<8} | {name}")
                 print(f"  命令行: {cmd_display}\n")
         sys.exit(0)
+
+    # 非 list 模式必须提供 port 和 peer-port
+    if args.port is None or args.peer_port is None:
+        log.error("--port 和 --peer-port 参数是必需的！")
+        log.error("用法: python afk_monitor.py --port <本机端口> --peer-port <对方端口> [--auto --auto-index N]")
+        sys.exit(1)
 
     # ========== PID 自动检测逻辑 ==========
     target_pid = args.pid
