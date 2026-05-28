@@ -24,7 +24,8 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+import urllib.request
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -135,8 +136,8 @@ class ProtocolMessage:
         return [cls.HEARTBEAT, cls.PEER_DOWN, cls.SHUTDOWN]
 
 
-Protocol = ProtocolMessage()
-
+Protocol = ProtocolMessage  # 类别名，方便引用常量
+ALL_MESSAGES: List[bytes] = Protocol.all_messages()  # 模块级缓存，避免每次连接重复构建
 
 # ==================== 配置管理 ====================
 @dataclass
@@ -145,7 +146,6 @@ class AppConfig:
     port: int = 18888
     peer_port: int = 18889
     auto_index: int = 0
-    instance_title: str = ""
 
     heartbeat_interval: int = 3
     heartbeat_timeout: int = 15
@@ -172,6 +172,7 @@ class AppConfig:
         config.restart_command = args.restart_command or ""
 
         # 尝试从配置文件加载默认值
+        data: dict = {}
         config_file = Path(args.config) if args.config else Path("config.json")
         if config_file.exists():
             try:
@@ -204,7 +205,6 @@ class AppConfig:
             config.port = args.port if args.port is not None else inst.get("port", config.port)
             config.peer_port = args.peer_port if args.peer_port is not None else inst.get("peer_port", config.peer_port)
             config.auto_index = inst.get("auto_index", config.auto_index)
-            config.instance_title = inst.get("title", f"实例{args.instance.upper()}")
         else:
             config.port = args.port if args.port is not None else config.port
             config.peer_port = args.peer_port if args.peer_port is not None else config.peer_port
@@ -213,16 +213,25 @@ class AppConfig:
         return config
 
     def _load_from_dict(self, data: dict):
-        """从字典加载配置值"""
-        for key in ("heartbeat_interval", "heartbeat_timeout", "reconnect_interval_min",
-                     "reconnect_interval_max", "startup_grace_period",
-                     "tcp_keepalive_idle", "tcp_keepalive_interval", "tcp_keepalive_count",
-                     "server_check_interval", "server_check_consecutive", "recv_buffer_max"):
-            if key in data:
-                setattr(self, key, data[key])
-        for key in ("log_file", "webhook_url"):
-            if key in data and not getattr(self, key):
-                setattr(self, key, data[key])
+        """从字典加载配置值，基于 dataclass 字段自动发现并校验类型"""
+        type_map = {f.name: f.type for f in fields(self)}
+        for key, value in data.items():
+            if key not in type_map:
+                continue
+            expected_type = type_map[key]
+            # 类型校验：拒绝错误类型的配置值
+            if expected_type is int and not isinstance(value, (int, float)):
+                log.warning(f"配置项 {key} 期望整数，实际为 {type(value).__name__}({value!r})，已忽略")
+                continue
+            if expected_type is bool and not isinstance(value, bool):
+                log.warning(f"配置项 {key} 期望布尔值，实际为 {type(value).__name__}({value!r})，已忽略")
+                continue
+            # 字符串字段：仅当当前值为空时才覆盖（CLI 参数优先）
+            if expected_type is str:
+                if not getattr(self, key):
+                    setattr(self, key, str(value))
+                continue
+            setattr(self, key, value)
 
 
 # ==================== Minecraft 进程自动检测 ====================
@@ -450,7 +459,6 @@ def send_webhook(url: str, message: str) -> None:
     if not url:
         return
     try:
-        import urllib.request
         data = json.dumps({"content": message}).encode('utf-8')
         req = urllib.request.Request(
             url, data=data,
@@ -523,9 +531,8 @@ class PeerConnection:
         self._conn_lock = threading.Lock()
         self._active_socket: Optional[socket.socket] = None
         self._peer_lost_triggered: bool = False
-        self._client_reconnect_backoff: int = config.reconnect_interval_min
         self._shutting_down: bool = False
-        self._psutil_permission_warned: bool = False  # 权限警告去重标记
+        self._stop_event = threading.Event()
 
         # 线程
         self.server_thread = threading.Thread(
@@ -605,7 +612,6 @@ class PeerConnection:
 
         self.peer_ever_connected = True
         self.last_heartbeat = time.time()
-        self._client_reconnect_backoff = self.config.reconnect_interval_min
         log.info(f"[{role_name}] 双向心跳已建立: {sock.getpeername()}")
 
         def send_loop() -> None:
@@ -629,7 +635,7 @@ class PeerConnection:
         def recv_loop() -> None:
             """接收循环：解析 HEARTBEAT / PEER_DOWN / SHUTDOWN 消息"""
             recv_buffer = b""
-            all_msgs = Protocol.all_messages()
+            all_msgs = ALL_MESSAGES
 
             while self.running and not self._peer_lost_triggered:
                 with self._conn_lock:
@@ -742,7 +748,7 @@ class PeerConnection:
     # ---------- 客户端 ----------
     def _run_client(self) -> None:
         """客户端重连循环"""
-        backoff = self._client_reconnect_backoff
+        backoff = self.config.reconnect_interval_min
         while self.running:
             sock: Optional[socket.socket] = None
             try:
@@ -788,7 +794,8 @@ class PeerConnection:
     def _heartbeat_checker(self) -> None:
         """心跳超时是判定对方掉线的兜底机制"""
         while self.running and not self._peer_lost_triggered:
-            time.sleep(1)
+            if self._stop_event.wait(timeout=1):
+                break
             elapsed = time.time() - self.last_heartbeat
             since_startup = time.time() - self.startup_time
 
@@ -838,6 +845,7 @@ class PeerConnection:
         graceful=False: 直接关闭（对方掉线触发）
         """
         self._shutting_down = True
+        self._stop_event.set()
         if graceful and not self._peer_lost_triggered:
             self._send_farewell(Protocol.SHUTDOWN)
         self.running = False

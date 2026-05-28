@@ -20,7 +20,7 @@ echo.
 echo 正在从 config.json 加载实例 B 配置...
 echo.
 if not exist "logs" mkdir "logs"
-for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value') do set "DT=%%I"
-set LOG_FILE=logs\crash_instance_b_%DT:~0,8%_%DT:~8,6%.log
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "DT=%%I"
+set LOG_FILE=logs\crash_instance_b_%DT%.log
 python afk_monitor.py --instance b --auto >"%LOG_FILE%" 2>&1
 pause
