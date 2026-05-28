@@ -68,6 +68,11 @@ LOCALHOST = "127.0.0.1"
 HEARTBEAT_MSG = b"ALIVE\n"
 STARTUP_GRACE_PERIOD = 90       # 启动宽限期：期间不因连接失败判定超时
 
+# TCP 优化常量（代理环境兼容）
+TCP_KEEPIDLE = 10               # TCP keepalive 空闲秒数（Windows 默认 2 小时，此处缩短）
+TCP_KEEPINTVL = 5               # TCP keepalive 探测间隔
+TCP_KEEPCNT = 3                 # TCP keepalive 探测次数
+
 
 # ==================== Minecraft 进程自动检测 ====================
 def find_minecraft_processes() -> List[Tuple[int, str, str]]:
@@ -225,6 +230,57 @@ class PeerConnection:
         self.proc_monitor_thread = threading.Thread(
             target=self._local_process_monitor, daemon=True, name="ProcMonitorThread")
 
+    # ---------- TCP Socket 优化（代理环境兼容）----------
+    @staticmethod
+    def _optimize_tcp_socket(sock: socket.socket):
+        """
+        对 TCP socket 进行代理环境兼容性优化：
+        1. TCP_NODELAY: 禁用 Nagle 算法，心跳小包立即发送不等待缓冲合并
+        2. SO_KEEPALIVE: 启用 TCP keepalive，防止代理/NAT 静默断开空闲连接
+        3. 平台相关 keepalive 参数 (TCP_KEEPIDLE/INTVL/CNT):
+           Linux/WSL/macOS 直接设置，Windows 通过 SIO_KEEPALIVE_VALS 设置
+        """
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass  # 某些环境不支持，忽略
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass  # 不支持则跳过
+
+        # 平台相关 keepalive 参数
+        try:
+            # Linux / WSL / macOS
+            if sys.platform != 'win32':
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPIDLE)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPINTVL)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPCNT)
+            else:
+                # Windows: 使用 SIO_KEEPALIVE_VALS（需要 ctypes）
+                import ctypes
+                from ctypes import wintypes
+
+                # winsock2 结构定义
+                class tcp_keepalive(ctypes.Structure):
+                    _fields_ = [
+                        ("onoff", wintypes.ULONG),
+                        ("keepalivetime", wintypes.ULONG),   # 毫秒
+                        ("keepaliveinterval", wintypes.ULONG),  # 毫秒
+                    ]
+
+                SIO_KEEPALIVE_VALS = 0x98000004
+                ka = tcp_keepalive(
+                    1,  # 启用
+                    TCP_KEEPIDLE * 1000,        # 空闲时间 → 毫秒
+                    TCP_KEEPINTVL * 1000        # 探测间隔 → 毫秒
+                )
+                sock.ioctl(SIO_KEEPALIVE_VALS, bytes(ka))
+        except (OSError, AttributeError, ImportError):
+            # 平台不支持或权限不足，使用 OS 默认 keepalive（Windows 默认 2h）
+            pass
+
     # ---------- 活跃连接管理 ----------
     def _set_active_socket(self, sock):
         """设置活跃 socket，如果已有则关闭旧的（保留新连接）"""
@@ -264,6 +320,13 @@ class PeerConnection:
         在已建立的 TCP 连接上启动双向心跳。
         role_name: "Server" 或 "Client"，仅用于日志。
         """
+        # 先优化 TCP socket（NODELAY + Keepalive），再开始心跳
+        self._optimize_tcp_socket(sock)
+        try:
+            sock.settimeout(HEARTBEAT_INTERVAL + 2)
+        except OSError:
+            pass
+
         self.peer_ever_connected = True
         self._set_active_socket(sock)
         self.last_heartbeat = time.time()
@@ -296,29 +359,62 @@ class PeerConnection:
                 log.info(f"[{role_name}] TCP 发送连接断开，将尝试重新连接...")
 
         def recv_loop():
-            try:
-                sock.settimeout(HEARTBEAT_INTERVAL + 2)
-            except OSError:
-                return
+            """
+            优化版 TCP 接收循环（代理环境兼容）：
+
+            问题：代理软件可能对 TCP 流进行分片/重组，导致单次 recv() 只收到
+                  部分数据而非完整心跳消息，或代理/NAT 静默断开连接后产生模糊
+                  的 OSError，需要区分处理。
+
+            改进：
+            1. 使用 recv_buffer 累积字节，按 HEARTBEAT_MSG 分隔符逐条解析
+            2. 收到任意 HEARTBEAT_MSG 即刷新 last_heartbeat
+            3. 代理软件典型错误码精确区分：
+               - ConnectionResetError (10054): 对端重置连接 → 真正断开
+               - ConnectionAbortedError (10053): 本地软件中止 → 可能是代理干扰
+               - 其他 OSError → 记录详细 errno 但不立即判定
+            """
+            recv_buffer = b""
             while self.running and not self._peer_lost_triggered:
                 with self._conn_lock:
                     cur = self._active_socket
                 if cur is not sock:
                     break
                 try:
-                    data = sock.recv(1024)
-                    if not data:
-                        log.warning(f"[{role_name}] 对方关闭了连接")
-                        break
-                    self.last_heartbeat = time.time()
+                    chunk = sock.recv(4096)
                 except socket.timeout:
                     continue
-                except OSError:
+                except ConnectionResetError:
+                    log.warning(f"[{role_name}] TCP 连接被重置 (ConnectionResetError)"
+                                f" — 代理或对端可能已断开")
                     break
-                except Exception:
+                except ConnectionAbortedError:
+                    log.warning(f"[{role_name}] TCP 连接被本地中止 (ConnectionAbortedError)"
+                                f" — 可能是代理软件干扰")
                     break
+                except ConnectionRefusedError:
+                    log.warning(f"[{role_name}] 连接被拒绝 (ConnectionRefusedError)")
+                    break
+                except OSError as e:
+                    log.error(f"[{role_name}] recv OSError (errno={e.errno}): {e}")
+                    break
+                except Exception as e:
+                    log.error(f"[{role_name}] recv 未知异常: {type(e).__name__}: {e}")
+                    break
+
+                if not chunk:
+                    log.warning(f"[{role_name}] 对方关闭了连接 (recv 返回空)")
+                    break
+
+                # 累积数据并解析心跳
+                recv_buffer += chunk
+                while HEARTBEAT_MSG in recv_buffer:
+                    idx = recv_buffer.index(HEARTBEAT_MSG)
+                    recv_buffer = recv_buffer[idx + len(HEARTBEAT_MSG):]
+                    self.last_heartbeat = time.time()
+
             # 接收失败或连接断开，清理连接，由心跳超时检测器最终判定是否掉线
-            log.debug(f"[{role_name}] 接收线程退出")
+            log.debug(f"[{role_name}] 接收线程退出 (buffer 残留 {len(recv_buffer)} bytes)")
             self._clear_active_socket(sock)
             try:
                 sock.close()
