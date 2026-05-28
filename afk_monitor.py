@@ -277,6 +277,8 @@ class PeerConnection:
                     break
                 try:
                     sock.sendall(HEARTBEAT_MSG)
+                except OSError:
+                    break
                 except Exception:
                     break
                 time.sleep(HEARTBEAT_INTERVAL)
@@ -291,7 +293,10 @@ class PeerConnection:
                 self._trigger_peer_lost(f"{role_name} 侧发送连接断开")
 
         def recv_loop():
-            sock.settimeout(HEARTBEAT_INTERVAL + 2)
+            try:
+                sock.settimeout(HEARTBEAT_INTERVAL + 2)
+            except OSError:
+                return
             while self.running and not self._peer_lost_triggered:
                 with self._conn_lock:
                     cur = self._active_socket
@@ -305,6 +310,8 @@ class PeerConnection:
                     self.last_heartbeat = time.time()
                 except socket.timeout:
                     continue
+                except OSError:
+                    break
                 except Exception:
                     break
             # 接收失败或连接断开，立即触发掉线处理（不等心跳超时）
