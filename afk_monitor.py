@@ -205,6 +205,88 @@ def interactive_select_minecraft_process(
     return None
 
 
+# ==================== Minecraft 服务器连接检测 ====================
+def get_minecraft_server_connection(pid: int) -> Optional[Tuple[str, int]]:
+    """
+    检测指定 PID 的 Minecraft 进程是否连接至远程服务器。
+    
+    通过 psutil 获取进程的所有 TCP 连接，过滤出：
+    - 状态为 ESTABLISHED
+    - 远程地址不是本地回环地址 (127.0.0.1)
+    - 端口为 Minecraft 默认端口范围 (25565 或其他常见端口)
+    
+    Args:
+        pid: Minecraft 进程的 PID
+        
+    Returns:
+        (remote_ip, remote_port) 如果找到服务器连接，否则返回 None
+    """
+    try:
+        proc = psutil.Process(pid)
+        connections = proc.connections(kind='tcp')
+        
+        for conn in connections:
+            # 只关心 ESTABLISHED 状态的连接
+            if conn.status != 'ESTABLISHED':
+                continue
+            
+            if not conn.raddr:
+                continue
+            
+            remote_ip = conn.raddr.ip
+            remote_port = conn.raddr.port
+            
+            # 排除本地回环地址 (127.x.x.x) 和 localhost
+            if remote_ip.startswith('127.'):
+                continue
+            if remote_ip == '::1' or remote_ip == '0.0.0.0':
+                continue
+            
+            # 找到了远程服务器连接
+            return (remote_ip, remote_port)
+        
+        return None
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+
+def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
+    """
+    获取指定 PID 进程的所有远程服务器连接（非本地回环）。
+    
+    Args:
+        pid: 进程 PID
+        
+    Returns:
+        List of (remote_ip, remote_port) tuples
+    """
+    connections_list = []
+    try:
+        proc = psutil.Process(pid)
+        connections = proc.connections(kind='tcp')
+        
+        for conn in connections:
+            if conn.status != 'ESTABLISHED':
+                continue
+            if not conn.raddr:
+                continue
+            
+            remote_ip = conn.raddr.ip
+            remote_port = conn.raddr.port
+            
+            # 排除本地回环地址
+            if remote_ip.startswith('127.'):
+                continue
+            if remote_ip == '::1' or remote_ip == '0.0.0.0':
+                continue
+            
+            connections_list.append((remote_ip, remote_port))
+        
+        return connections_list
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return []
+
+
 # ==================== 进程管理 ====================
 def check_process_alive(pid):
     """检查指定 PID 的进程是否存活"""
@@ -521,6 +603,15 @@ def main():
         "--heartbeat-timeout", type=int, default=HEARTBEAT_TIMEOUT,
         help=f"心跳超时秒数（默认: {HEARTBEAT_TIMEOUT}）"
     )
+    parser.add_argument(
+        "--check-server", action="store_true", default=False,
+        help="启用服务器连接检测：监控 MC 客户端是否与远程服务器保持连接，"
+             "如果客户端断开服务器连接，自动结束本地 MC 进程"
+    )
+    parser.add_argument(
+        "--server-check-interval", type=int, default=10,
+        help=f"服务器连接检测间隔秒数（默认: 10，仅在 --check-server 时生效）"
+    )
 
     args = parser.parse_args()
 
@@ -589,6 +680,28 @@ def main():
     log.info(f"监控进程: {proc.name()} (PID: {target_pid})")
     log.info(f"心跳间隔: {HEARTBEAT_INTERVAL}s, 超时: {HEARTBEAT_TIMEOUT}s")
 
+    # ==================== 显示服务器连接状态 ====================
+    log.info("-" * 40)
+    log.info("正在检测 Minecraft 客户端与服务器的连接状态...")
+    server_conn = get_minecraft_server_connection(target_pid)
+    if server_conn:
+        log.info(f"✓ 客户端已连接至服务器: {server_conn[0]}:{server_conn[1]}")
+    else:
+        log.warning("✗ 客户端当前未连接至任何远程服务器！")
+        log.warning("  可能原因: 尚未进入服务器、使用了本地服务器(127.0.0.1)、或连接检测权限不足")
+    
+    all_conns = get_all_server_connections(target_pid)
+    if len(all_conns) > 1:
+        log.info(f"  检测到 {len(all_conns)} 个远程连接:")
+        for ip, port in all_conns:
+            log.info(f"    - {ip}:{port}")
+    log.info("-" * 40)
+
+    if args.check_server:
+        log.info(f"服务器连接检测已启用，检测间隔: {args.server_check_interval}s")
+        log.info("如果客户端断开服务器连接，将自动结束本地 MC 进程。")
+    log.info("")
+
     # ==================== 掉线处理回调 ====================
     def on_peer_lost():
         """对方掉线时的处理：终止本地 Minecraft 进程"""
@@ -599,6 +712,33 @@ def main():
         kill_process(target_pid)
         log.info("本地 Minecraft 进程已结束，脚本即将退出。")
         os._exit(0)  # 强制退出，不等待线程
+
+    def on_server_disconnect():
+        """客户端断开服务器连接时的处理"""
+        log.warning("=" * 50)
+        log.warning("检测到 Minecraft 客户端已断开服务器连接！")
+        log.warning(f"正在结束本地 Minecraft 进程 (PID: {target_pid}) ...")
+        log.warning("=" * 50)
+        kill_process(target_pid)
+        log.info("本地 Minecraft 进程已结束，脚本即将退出。")
+        os._exit(0)
+
+    # ==================== 服务器连接监控线程 ====================
+    def server_connection_monitor(pid, interval, peer_obj, on_disconnect):
+        """
+        后台线程：定期检测 Minecraft 客户端是否保持与服务器的连接。
+        如果检测到断开，调用 on_disconnect 回调。
+        """
+        log.info(f"[服务器检测] 监控线程已启动 (PID: {pid}, 间隔: {interval}s)")
+        while peer_obj.running:
+            time.sleep(interval)
+            if not check_process_alive(pid):
+                break  # 进程监控线程会处理
+            conn = get_minecraft_server_connection(pid)
+            if conn is None:
+                log.warning(f"[服务器检测] 客户端已断开服务器连接 (PID: {pid})")
+                on_disconnect()
+                break
 
     # ==================== 创建并启动对等连接 ====================
     peer = PeerConnection(
@@ -618,6 +758,17 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     peer.start()
+
+    # 如果启用了服务器连接检测，启动监控线程
+    server_check_thread = None
+    if args.check_server:
+        server_check_thread = threading.Thread(
+            target=server_connection_monitor,
+            args=(target_pid, args.server_check_interval, peer, on_server_disconnect),
+            daemon=True,
+            name="ServerCheckThread"
+        )
+        server_check_thread.start()
 
     # 主线程保持运行，直到 running 变为 False
     try:
