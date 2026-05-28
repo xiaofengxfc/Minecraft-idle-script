@@ -1,0 +1,59 @@
+============================================================
+   Minecraft AFK 挂机互保脚本 - 使用说明
+============================================================
+
+【功能概述】
+  本脚本用于 Minecraft 服务器挂机，两个客户端运行在同一台机器上，
+  通过本地 TCP 心跳互相检测在线状态。
+  一方掉线后，另一方自动结束自己的 Minecraft 客户端进程。
+
+【运行原理】
+  - 两个脚本实例通过 127.0.0.1 本地回环 TCP 连接通信（纯本地，不联网）
+  - 每 3 秒发送一次心跳（ALIVE 消息）
+  - 超过 15 秒未收到对方心跳即判定对方掉线
+  - 检测到对方掉线后，自动终止本地的 Minecraft 进程
+  - 同时监控本地 MC 进程，本地 MC 退出时主动断开连接通知对方
+
+【文件说明】
+  afk_monitor.py      - 核心 Python 脚本
+  start_instance_a.bat - 启动实例 A 的批处理（端口18888，对方18889）
+  start_instance_b.bat - 启动实例 B 的批处理（端口18889，对方18888）
+  使用说明.txt         - 本文件
+
+【第一步：安装依赖】
+  脚本运行时会自动安装 psutil，也可手动安装：
+    pip install psutil
+
+【第二步：获取 Minecraft 进程 PID】
+  方法一：打开任务管理器 -> 详细信息 -> 找到 javaw.exe 或 Minecraft 进程 -> 查看 PID 列
+  方法二：命令行执行（PowerShell）：
+    Get-Process | Where-Object {$_.ProcessName -like "*java*" -or $_.ProcessName -like "*minecraft*"} | Select-Object Id, ProcessName
+
+【第三步：启动脚本】
+  1. 先启动两个 Minecraft 客户端并登录到服务器
+  2. 双击 start_instance_a.bat，输入 Minecraft 客户端 A 的 PID
+  3. 双击 start_instance_b.bat，输入 Minecraft 客户端 B 的 PID
+  4. 两个 CMD 窗口都应显示"已连接到对方"并持续输出心跳
+
+  （注意：两个脚本都需要保持运行，不能关闭 CMD 窗口）
+
+【手动命令行启动（高级）】
+  python afk_monitor.py --port 18888 --peer-port 18889 --pid <MC-A的PID>
+  python afk_monitor.py --port 18889 --peer-port 18888 --pid <MC-B的PID>
+
+【可选参数】
+  --heartbeat-interval <秒>  心跳间隔，默认 3 秒
+  --heartbeat-timeout <秒>   超时时间，默认 15 秒
+
+【测试方法】
+  1. 两个实例都正常启动并互连后
+  2. 手动关闭一个 Minecraft 客户端
+  3. 观察另一个 CMD 窗口，应在 15 秒内显示"检测到对方客户端掉线！"
+  4. 对应的 Minecraft 进程应被自动终止
+
+【注意事项】
+  - 必须使用管理员权限运行脚本，否则可能无法终止 Minecraft 进程
+  - 两个实例的端口号不能相同
+  - 如果端口被占用，可修改 .bat 文件中的端口号
+  - 防火墙/杀毒软件可能拦截本地 TCP 连接，如连接失败请检查
+  - Ctrl+C 可安全退出脚本（不会触发掉线检测）
