@@ -1049,10 +1049,13 @@ def main() -> None:
     # PID 自动检测
     target_pid = args.pid
 
-    if args.auto and target_pid is not None:
-        log.warning("同时指定 --auto 和 --pid，优先使用 --pid 手动指定模式。")
+    # 使用 --instance 时自动启用进程检测（无需手动加 --auto）
+    should_auto_detect = args.auto or (args.instance and target_pid is None)
 
-    if args.auto and target_pid is None:
+    if should_auto_detect and target_pid is not None:
+        log.warning("同时指定自动检测和 --pid，优先使用 --pid 手动指定模式。")
+
+    if should_auto_detect and target_pid is None:
         log.info("=" * 50)
         log.info("全自动检测模式")
         log.info("=" * 50)
@@ -1082,7 +1085,7 @@ def main() -> None:
 
     if target_pid is None:
         log.error("未指定要监控的进程！")
-        log.error("请使用 --auto --auto-index 0 或 --pid <PID>")
+        log.error("请使用 --instance a/b 或 --auto --auto-index 0 或 --pid <PID>")
         sys.exit(1)
 
     if not check_process_alive(target_pid):
