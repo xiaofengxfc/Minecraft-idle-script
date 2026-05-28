@@ -258,25 +258,14 @@ class PeerConnection:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPINTVL)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPCNT)
             else:
-                # Windows: 使用 SIO_KEEPALIVE_VALS（需要 ctypes）
-                import ctypes
-                from ctypes import wintypes
-
-                # winsock2 结构定义
-                class tcp_keepalive(ctypes.Structure):
-                    _fields_ = [
-                        ("onoff", wintypes.ULONG),
-                        ("keepalivetime", wintypes.ULONG),   # 毫秒
-                        ("keepaliveinterval", wintypes.ULONG),  # 毫秒
-                    ]
-
+                # Windows: 使用 SIO_KEEPALIVE_VALS
+                # Python socket.ioctl 的第二个参数需要是 3 元组
+                # 而非 bytes，直接传入 (onoff, keepalivetime_ms, keepaliveinterval_ms)
                 SIO_KEEPALIVE_VALS = 0x98000004
-                ka = tcp_keepalive(
-                    1,  # 启用
-                    TCP_KEEPIDLE * 1000,        # 空闲时间 → 毫秒
-                    TCP_KEEPINTVL * 1000        # 探测间隔 → 毫秒
+                sock.ioctl(
+                    SIO_KEEPALIVE_VALS,
+                    (1, TCP_KEEPIDLE * 1000, TCP_KEEPINTVL * 1000)
                 )
-                sock.ioctl(SIO_KEEPALIVE_VALS, bytes(ka))
         except (OSError, AttributeError, ImportError):
             # 平台不支持或权限不足，使用 OS 默认 keepalive（Windows 默认 2h）
             pass
