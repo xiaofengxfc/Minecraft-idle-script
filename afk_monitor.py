@@ -33,6 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
 # ==================== 自动安装依赖 ====================
 def ensure_psutil():
     """确保 psutil 已安装，否则自动安装"""
@@ -55,14 +56,18 @@ def ensure_psutil():
             log.error("请手动执行: pip install psutil")
             sys.exit(1)
 
+
 psutil = ensure_psutil()
 
 # ==================== 配置常量 ====================
-HEARTBEAT_INTERVAL = 3
-HEARTBEAT_TIMEOUT = 15
-RECONNECT_INTERVAL = 5
+HEARTBEAT_INTERVAL = 3          # 发送心跳间隔
+HEARTBEAT_TIMEOUT = 15          # 收不到心跳的超时时间
+RECONNECT_INTERVAL_MIN = 2      # 重连最短间隔
+RECONNECT_INTERVAL_MAX = 30     # 重连最长间隔（指数退避上限）
 LOCALHOST = "127.0.0.1"
 HEARTBEAT_MSG = b"ALIVE\n"
+STARTUP_GRACE_PERIOD = 90       # 启动宽限期：期间不因连接失败判定超时
+
 
 # ==================== Minecraft 进程自动检测 ====================
 def find_minecraft_processes() -> List[Tuple[int, str, str]]:
@@ -107,7 +112,6 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
-    # 按 PID 升序排序，确保每次检测结果稳定一致
     minecraft_processes.sort(key=lambda p: p[0])
     return minecraft_processes
 
@@ -182,7 +186,17 @@ def kill_process(pid):
 
 # ==================== 对等连接管理器 ====================
 class PeerConnection:
-    """管理与对等脚本的 TCP 心跳连接"""
+    """
+    管理与对等脚本的 TCP 心跳连接。
+
+    核心设计：
+    - 双方各自启动 TCP Server 监听自身端口
+    - 双方各自作为 Client 去连接对方端口
+    - 任意一条 TCP 连接建立后，在该连接上进行双向心跳收发
+    - 发送线程定期发送 HEARTBEAT_MSG，接收线程持续读取并刷新 last_heartbeat
+    - 任意方向检测到连接断开时立即触发 on_peer_lost，不等心跳超时
+    - 心跳超时作为最终兜底机制
+    """
 
     def __init__(self, port, peer_port, monitored_pid, on_peer_lost):
         self.port = port
@@ -191,13 +205,16 @@ class PeerConnection:
         self.on_peer_lost = on_peer_lost
 
         self.server_socket = None
-        self.client_socket = None
         self.last_heartbeat = time.time()
         self.startup_time = time.time()
-        self.peer_ever_connected = False
+        self.peer_ever_connected = False      # 是否有过任意 TCP 连接
         self.running = True
-        self.lock = threading.Lock()
+        self._conn_lock = threading.Lock()     # 保护活跃连接和防重复触发
+        self._active_socket = None             # 当前活跃的双向心跳 socket
+        self._peer_lost_triggered = False      # 防止重复触发 on_peer_lost
+        self._client_reconnect_backoff = RECONNECT_INTERVAL_MIN
 
+        # 各线程
         self.server_thread = threading.Thread(
             target=self._run_server, daemon=True, name="ServerThread")
         self.client_thread = threading.Thread(
@@ -207,30 +224,105 @@ class PeerConnection:
         self.proc_monitor_thread = threading.Thread(
             target=self._local_process_monitor, daemon=True, name="ProcMonitorThread")
 
-    def start(self):
-        log.info(f"本实例监听端口: {self.port}")
-        log.info(f"对方实例端口: {self.peer_port}")
-        log.info(f"监控进程 PID: {self.monitored_pid}")
-        self.server_thread.start()
-        self.client_thread.start()
-        self.checker_thread.start()
-        self.proc_monitor_thread.start()
+    # ---------- 活跃连接管理 ----------
+    def _set_active_socket(self, sock):
+        """设置活跃 socket，如果已有则关闭旧的（保留新连接）"""
+        with self._conn_lock:
+            old = self._active_socket
+            self._active_socket = sock
+            if old and old is not sock:
+                try:
+                    old.close()
+                except Exception:
+                    pass
 
-    def stop(self):
+    def _clear_active_socket(self, sock=None):
+        """清除活跃 socket（仅当匹配时清除）"""
+        with self._conn_lock:
+            if sock is None or self._active_socket is sock:
+                self._active_socket = None
+
+    def _trigger_peer_lost(self, reason: str = ""):
+        """
+        线程安全地触发 on_peer_lost，确保只执行一次。
+        当 TCP 连接断开时（收/发失败或对端主动关闭），立即触发，不等心跳超时。
+        """
+        with self._conn_lock:
+            if self._peer_lost_triggered:
+                return
+            self._peer_lost_triggered = True
+        if reason:
+            log.warning(f"检测到连接断开: {reason}")
+        log.warning("对方已断开连接，正在结束本地 Minecraft 客户端...")
         self.running = False
-        self._close_sockets()
+        self.on_peer_lost()
 
-    def _close_sockets(self):
-        with self.lock:
-            for attr in ('client_socket', 'server_socket'):
-                s = getattr(self, attr, None)
-                if s:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-                    setattr(self, attr, None)
+    # ---------- 双向心跳 ----------
+    def _start_bidirectional_heartbeat(self, sock, role_name: str):
+        """
+        在已建立的 TCP 连接上启动双向心跳。
+        role_name: "Server" 或 "Client"，仅用于日志。
+        """
+        self.peer_ever_connected = True
+        self._set_active_socket(sock)
+        self.last_heartbeat = time.time()
+        self._client_reconnect_backoff = RECONNECT_INTERVAL_MIN  # 重置退避
+        log.info(f"[{role_name}] 双向心跳已建立: {sock.getpeername()}")
 
+        def send_loop():
+            while self.running and not self._peer_lost_triggered:
+                with self._conn_lock:
+                    cur = self._active_socket
+                if cur is not sock:
+                    break
+                try:
+                    sock.sendall(HEARTBEAT_MSG)
+                except Exception:
+                    break
+                time.sleep(HEARTBEAT_INTERVAL)
+            # 发送失败，立即触发掉线处理（不等心跳超时）
+            log.debug(f"[{role_name}] 发送线程退出")
+            self._clear_active_socket(sock)
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if self.running and not self._peer_lost_triggered:
+                self._trigger_peer_lost(f"{role_name} 侧发送连接断开")
+
+        def recv_loop():
+            sock.settimeout(HEARTBEAT_INTERVAL + 2)
+            while self.running and not self._peer_lost_triggered:
+                with self._conn_lock:
+                    cur = self._active_socket
+                if cur is not sock:
+                    break
+                try:
+                    data = sock.recv(1024)
+                    if not data:
+                        log.warning(f"[{role_name}] 对方关闭了连接")
+                        break
+                    self.last_heartbeat = time.time()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+            # 接收失败或连接断开，立即触发掉线处理（不等心跳超时）
+            log.debug(f"[{role_name}] 接收线程退出")
+            self._clear_active_socket(sock)
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if self.running and not self._peer_lost_triggered:
+                self._trigger_peer_lost(f"{role_name} 侧接收连接断开")
+
+        threading.Thread(target=send_loop, daemon=True,
+                         name=f"HBSend-{role_name}").start()
+        threading.Thread(target=recv_loop, daemon=True,
+                         name=f"HBRecv-{role_name}").start()
+
+    # ---------- 服务端 ----------
     def _run_server(self):
         while self.running:
             try:
@@ -244,9 +336,8 @@ class PeerConnection:
                 while self.running:
                     try:
                         conn, addr = self.server_socket.accept()
-                        log.info(f"对方已连接: {addr}")
-                        threading.Thread(target=self._handle_incoming,
-                                         args=(conn,), daemon=True).start()
+                        log.info(f"对方已连接（来自: {addr}）-> 启动双向心跳（Server 侧）")
+                        self._start_bidirectional_heartbeat(conn, "Server")
                     except socket.timeout:
                         continue
                     except Exception as e:
@@ -265,89 +356,97 @@ class PeerConnection:
                         pass
                     self.server_socket = None
 
-    def _handle_incoming(self, conn):
-        self.peer_ever_connected = True
-        conn.settimeout(HEARTBEAT_INTERVAL + 2)
-        while self.running:
-            try:
-                data = conn.recv(1024)
-                if not data:
-                    log.warning("对方关闭了连接")
-                    break
-                self.last_heartbeat = time.time()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    log.warning(f"接收数据错误: {e}")
-                break
-        try:
-            conn.close()
-        except Exception:
-            pass
-
+    # ---------- 客户端 ----------
     def _run_client(self):
+        backoff = self._client_reconnect_backoff
         while self.running:
             sock = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
                 sock.connect((LOCALHOST, self.peer_port))
-                log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port}")
-                self.peer_ever_connected = True
-                # 连接成功后重置心跳时间，给对方一点时间建立反向连接
-                self.last_heartbeat = time.time()
-                with self.lock:
-                    self.client_socket = sock
+                log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port} -> 启动双向心跳（Client 侧）")
+                self._start_bidirectional_heartbeat(sock, "Client")
+                # 双向心跳线程接管后，客户端连接循环等待直到连接断开
                 while self.running:
-                    try:
-                        sock.sendall(HEARTBEAT_MSG)
-                    except Exception as e:
-                        log.warning(f"发送心跳失败: {e}")
-                        break
-                    time.sleep(HEARTBEAT_INTERVAL)
+                    with self._conn_lock:
+                        if self._active_socket is sock:
+                            time.sleep(HEARTBEAT_INTERVAL)
+                            continue
+                    break
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
-                if self.running:
+                elapsed = time.time() - self.startup_time
+                if elapsed < STARTUP_GRACE_PERIOD:
+                    log.info(f"等待对方实例启动... "
+                             f"({LOCALHOST}:{self.peer_port} 尚未就绪，"
+                             f"宽限期剩余 {STARTUP_GRACE_PERIOD - int(elapsed)}s)")
+                else:
                     log.warning(f"连接对方失败 ({LOCALHOST}:{self.peer_port}): {e}")
-                    log.info(f"{RECONNECT_INTERVAL}秒后重试...")
+                backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
+                log.info(f"{backoff}秒后重试...")
             finally:
-                with self.lock:
-                    self.client_socket = None
                 if sock:
                     try:
                         sock.close()
                     except Exception:
                         pass
                 if self.running:
-                    time.sleep(RECONNECT_INTERVAL)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
 
+    # ---------- 超时检测（兜底机制）----------
     def _heartbeat_checker(self):
-        # 启动宽限期：60秒内即使从未连接也不判定超时，给另一实例足够启动时间
-        STARTUP_GRACE_PERIOD = 60
-        while self.running:
+        """心跳超时作为最终兜底，正常情况由 recv/send 线程直接触发"""
+        while self.running and not self._peer_lost_triggered:
             time.sleep(1)
             elapsed = time.time() - self.last_heartbeat
             since_startup = time.time() - self.startup_time
+
             if elapsed > HEARTBEAT_TIMEOUT:
-                # 启动宽限期内且从未连接过对方：等待而非判定超时
+                # 启动宽限期：即使超时也不判定，给对方充足启动时间
                 if since_startup < STARTUP_GRACE_PERIOD and not self.peer_ever_connected:
-                    log.info(f"[{int(since_startup)}s] 等待对方实例启动中... (宽限期剩余 {STARTUP_GRACE_PERIOD - int(since_startup)}s)")
+                    remain = STARTUP_GRACE_PERIOD - int(since_startup)
+                    if int(since_startup) % 10 == 0:
+                        log.info(f"[{int(since_startup)}s] 等待对方实例启动中... "
+                                 f"(宽限期剩余 {remain}s)")
+                    # 重置计时器，避免宽限期内误判
+                    self.last_heartbeat = time.time()
                     continue
                 log.error(f"心跳超时！已 {elapsed:.0f} 秒未收到对方心跳")
                 log.error("对方已掉线，正在结束本地 Minecraft 客户端...")
-                self.on_peer_lost()
-                self.running = False
-                break
+                self._trigger_peer_lost("心跳超时")
 
+    # ---------- 本地进程监控 ----------
     def _local_process_monitor(self):
         while self.running:
             time.sleep(HEARTBEAT_INTERVAL)
             if not check_process_alive(self.monitored_pid):
                 log.warning(f"本地 Minecraft 进程已退出 (PID: {self.monitored_pid})")
                 log.warning("主动断开连接，通知对方...")
-                self._close_sockets()
+                self._clear_active_socket()
                 self.running = False
                 break
+
+    # ---------- 启动 / 停止 ----------
+    def start(self):
+        log.info(f"本实例监听端口: {self.port}")
+        log.info(f"对方实例端口: {self.peer_port}")
+        log.info(f"监控进程 PID: {self.monitored_pid}")
+        self.server_thread.start()
+        self.client_thread.start()
+        self.checker_thread.start()
+        self.proc_monitor_thread.start()
+
+    def stop(self):
+        self.running = False
+        self._clear_active_socket()
+        # 关闭 server socket 以释放端口
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
 
 
 # ==================== 主程序 ====================
@@ -414,7 +513,7 @@ def main():
 
     if args.auto and target_pid is None:
         log.info("=" * 50)
-        log.info("全自动检测模式 - 无需任何手动操作")
+        log.info("全自动检测模式")
         log.info("=" * 50)
         log.info("正在扫描 Minecraft Java 进程...")
 
