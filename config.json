@@ -1,0 +1,28 @@
+{
+    "_comment": "Minecraft AFK 挂机互保脚本配置文件",
+    "heartbeat_interval": 3,
+    "heartbeat_timeout": 15,
+    "reconnect_interval_min": 2,
+    "reconnect_interval_max": 30,
+    "startup_grace_period": 90,
+    "tcp_keepalive_idle": 10,
+    "tcp_keepalive_interval": 5,
+    "tcp_keepalive_count": 3,
+    "server_check_interval": 10,
+    "server_check_consecutive": 2,
+    "recv_buffer_max": 65536,
+    "instance_a": {
+        "port": 18888,
+        "peer_port": 18889,
+        "auto_index": 0,
+        "title": "实例A"
+    },
+    "instance_b": {
+        "port": 18889,
+        "peer_port": 18888,
+        "auto_index": 1,
+        "title": "实例B"
+    },
+    "log_file": "afk_monitor.log",
+    "webhook_url": ""
+}

@@ -7,38 +7,58 @@ Minecraft AFK 挂机互保脚本
       一方掉线（进程退出或网络断开），另一方自动结束自己的 Minecraft 客户端进程。
 
 使用方式：
-    实例A: python afk_monitor.py --port 18888 --peer-port 18889 --auto --auto-index 0
-    实例B: python afk_monitor.py --port 18889 --peer-port 18888 --auto --auto-index 1
+    实例A: python afk_monitor.py --instance a
+    实例B: python afk_monitor.py --instance b
     手动:  python afk_monitor.py --port 18888 --peer-port 18889 --pid <MC进程PID>
 
 依赖：psutil（脚本会自动尝试安装）
 """
 
+import argparse
+import json
+import logging
+import os
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
-import os
-import sys
-import signal
-import argparse
-import subprocess
-import logging
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
 
 # ==================== 日志配置 ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
-log = logging.getLogger(__name__)
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
+LOG_DATE_FORMAT = '%H:%M:%S'
+
+log = logging.getLogger("afk_monitor")
+
+
+def setup_logging(log_file: Optional[str] = None, level: int = logging.INFO):
+    """配置控制台和文件日志输出"""
+    logger = logging.getLogger("afk_monitor")
+    logger.setLevel(level)
+    logger.handlers.clear()
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    logger.addHandler(console_handler)
+
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+            logger.addHandler(file_handler)
+        except Exception as e:
+            logger.warning(f"无法创建日志文件 {log_file}: {e}")
 
 
 # ==================== 自动安装依赖 ====================
 def ensure_psutil():
     """确保 psutil 已安装，否则自动安装"""
     try:
-        import psutil
+        import psutil  # noqa: F811
         return psutil
     except ImportError:
         log.warning("psutil 未安装，正在自动安装...")
@@ -49,7 +69,7 @@ def ensure_psutil():
                 stderr=subprocess.DEVNULL
             )
             log.info("psutil 安装成功")
-            import psutil
+            import psutil  # noqa: F811
             return psutil
         except Exception as e:
             log.error(f"psutil 安装失败: {e}")
@@ -59,24 +79,110 @@ def ensure_psutil():
 
 psutil = ensure_psutil()
 
-# ==================== 配置常量 ====================
-HEARTBEAT_INTERVAL = 3          # 发送心跳间隔
-HEARTBEAT_TIMEOUT = 15          # 收不到心跳的超时时间
-RECONNECT_INTERVAL_MIN = 2      # 重连最短间隔
-RECONNECT_INTERVAL_MAX = 30     # 重连最长间隔（指数退避上限）
 LOCALHOST = "127.0.0.1"
 
-# ---- 协议消息 ----
-HEARTBEAT_MSG = b"ALIVE\n"      # 心跳消息 — 刷新对方 last_heartbeat
-PEER_DOWN_MSG = b"PEER_DOWN\n"  # 我方 MC 进程已退出 — 对方收到后应立即杀进程
-SHUTDOWN_MSG = b"SHUTDOWN\n"    # 脚本正常退出 (Ctrl+C) — 对方可安全退出
 
-STARTUP_GRACE_PERIOD = 90       # 启动宽限期：期间不因连接失败判定超时
+# ==================== 协议消息定义 ====================
+@dataclass
+class ProtocolMessage:
+    """心跳协议消息常量"""
+    HEARTBEAT: bytes = b"ALIVE\n"
+    PEER_DOWN: bytes = b"PEER_DOWN\n"
+    SHUTDOWN: bytes = b"SHUTDOWN\n"
 
-# TCP 优化常量（代理环境兼容）
-TCP_KEEPIDLE = 10               # TCP keepalive 空闲秒数
-TCP_KEEPINTVL = 5               # TCP keepalive 探测间隔
-TCP_KEEPCNT = 3                 # TCP keepalive 探测次数
+    @classmethod
+    def all_messages(cls) -> List[bytes]:
+        return [cls.HEARTBEAT, cls.PEER_DOWN, cls.SHUTDOWN]
+
+
+Protocol = ProtocolMessage()
+
+
+# ==================== 配置管理 ====================
+@dataclass
+class AppConfig:
+    """应用程序运行配置"""
+    port: int = 18888
+    peer_port: int = 18889
+    auto_index: int = 0
+    instance_title: str = ""
+
+    heartbeat_interval: int = 3
+    heartbeat_timeout: int = 15
+    reconnect_interval_min: int = 2
+    reconnect_interval_max: int = 30
+    startup_grace_period: int = 90
+    tcp_keepalive_idle: int = 10
+    tcp_keepalive_interval: int = 5
+    tcp_keepalive_count: int = 3
+    server_check_interval: int = 10
+    server_check_consecutive: int = 2
+    recv_buffer_max: int = 65536
+
+    log_file: str = ""
+    webhook_url: str = ""
+    restart_command: str = ""
+    no_check_server: bool = False
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "AppConfig":
+        """从命令行参数创建配置，支持 config.json 文件预设"""
+        config = cls()
+        config.no_check_server = args.no_check_server
+        config.restart_command = args.restart_command or ""
+
+        # 尝试从配置文件加载默认值
+        config_file = Path(args.config) if args.config else Path("config.json")
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                config._load_from_dict(data)
+                log.info(f"已从 {config_file} 加载配置")
+            except Exception as e:
+                log.warning(f"加载配置文件失败: {e}")
+
+        # 命令行参数覆盖配置文件（-1 表示未指定）
+        if args.heartbeat_interval >= 0:
+            config.heartbeat_interval = args.heartbeat_interval
+        if args.heartbeat_timeout >= 0:
+            config.heartbeat_timeout = args.heartbeat_timeout
+        if args.server_check_interval >= 0:
+            config.server_check_interval = args.server_check_interval
+        if args.webhook_url:
+            config.webhook_url = args.webhook_url
+        if args.log_file:
+            config.log_file = args.log_file
+
+        # 实例快捷参数
+        if args.instance:
+            instances = data.get("instance_a", {}), data.get("instance_b", {})
+            if args.instance == 'a':
+                inst = instances[0] if instances[0] else {"port": 18888, "peer_port": 18889, "auto_index": 0}
+            else:
+                inst = instances[1] if instances[1] else {"port": 18889, "peer_port": 18888, "auto_index": 1}
+            config.port = args.port if args.port is not None else inst.get("port", config.port)
+            config.peer_port = args.peer_port if args.peer_port is not None else inst.get("peer_port", config.peer_port)
+            config.auto_index = inst.get("auto_index", config.auto_index)
+            config.instance_title = inst.get("title", f"实例{args.instance.upper()}")
+        else:
+            config.port = args.port if args.port is not None else config.port
+            config.peer_port = args.peer_port if args.peer_port is not None else config.peer_port
+            config.auto_index = args.auto_index
+
+        return config
+
+    def _load_from_dict(self, data: dict):
+        """从字典加载配置值"""
+        for key in ("heartbeat_interval", "heartbeat_timeout", "reconnect_interval_min",
+                     "reconnect_interval_max", "startup_grace_period",
+                     "tcp_keepalive_idle", "tcp_keepalive_interval", "tcp_keepalive_count",
+                     "server_check_interval", "server_check_consecutive", "recv_buffer_max"):
+            if key in data:
+                setattr(self, key, data[key])
+        for key in ("log_file", "webhook_url"):
+            if key in data and not getattr(self, key):
+                setattr(self, key, data[key])
 
 
 # ==================== Minecraft 进程自动检测 ====================
@@ -85,7 +191,7 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
     扫描系统中所有正在运行的 Minecraft Java 进程。
     返回按 PID 升序排列的 (pid, process_name, command_line) 列表。
     """
-    minecraft_processes = []
+    minecraft_processes: List[Tuple[int, str, str]] = []
 
     mc_keywords = [
         'minecraft', 'forge', 'fabric', 'nide8auth', 'authlib-injector',
@@ -110,7 +216,6 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
             if not is_mc:
                 continue
 
-            display = name
             if 'minecraft' in cmdline_lower:
                 display = f"{name} [Minecraft]"
             elif any(k in cmdline_lower for k in ['forge', 'fabric']):
@@ -127,34 +232,24 @@ def find_minecraft_processes() -> List[Tuple[int, str, str]]:
 
 
 # ==================== 服务器连接检测 ====================
-
-# 非 Minecraft 游戏服务器的常见端口（认证/API/CDN/Web）
-# 这些端口上的连接通常不是游戏服务器连接，应予以排除
-_NON_GAME_PORTS = {
-    80, 443, 8080, 8443,  # HTTP/HTTPS
-    21, 22, 23,            # FTP/SSH/Telnet
-    53,                    # DNS
-    110, 143, 993, 995,   # POP3/IMAP
-    25, 465, 587,          # SMTP
+# 非游戏服务器端口（认证/API/CDN/Web）
+_NON_GAME_PORTS: set = {
+    80, 443, 8080, 8443,
+    21, 22, 23,
+    53,
+    110, 143, 993, 995,
+    25, 465, 587,
 }
 
-# Minecraft 默认端口及常见范围
 _MC_DEFAULT_PORT = 25565
-_MC_COMMON_PORT_RANGE = range(10000, 60000)  # 常见服务器端口范围
 
 
-def _is_likely_game_port(port: int) -> bool:
-    """
-    判断端口是否可能是 Minecraft 游戏服务器端口。
-    
-    排除常见的 Web/API/CDN 端口（如 443, 80），保留游戏常用的高端口。
-    """
+def is_likely_game_port(port: int) -> bool:
+    """判断端口是否可能是 Minecraft 游戏服务器端口"""
     if port in _NON_GAME_PORTS:
         return False
-    # Minecraft 默认端口直接通过
     if port == _MC_DEFAULT_PORT:
         return True
-    # 高端口范围内认为可能是游戏服务器
     if port >= 1024:
         return True
     return False
@@ -163,21 +258,15 @@ def _is_likely_game_port(port: int) -> bool:
 def get_minecraft_server_connection(pid: int) -> Optional[Tuple[str, int]]:
     """
     获取 Minecraft 进程的主游戏服务器连接（排除本地回环和非游戏端口）。
-    
-    过滤策略：
-    1. 排除本地回环地址
-    2. 排除常见的非游戏端口（443/80 等认证/API 端口）
-    3. 优先返回可能是 Minecraft 游戏服务器的连接
     """
     try:
-        # 第一轮：查找明确是游戏端口的连接（排除 443/80 等）
         for conn in psutil.Process(pid).net_connections(kind='tcp'):
             if conn.status != 'ESTABLISHED' or not conn.raddr:
                 continue
             ip = conn.raddr.ip
             if ip.startswith('127.') or ip in ('::1', '0.0.0.0'):
                 continue
-            if _is_likely_game_port(conn.raddr.port):
+            if is_likely_game_port(conn.raddr.port):
                 return (ip, conn.raddr.port)
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         pass
@@ -185,11 +274,8 @@ def get_minecraft_server_connection(pid: int) -> Optional[Tuple[str, int]]:
 
 
 def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
-    """
-    获取所有远程连接（排除本地回环）。
-    返回全部连接，包括非游戏端口，用于日志展示。
-    """
-    result = []
+    """获取所有远程连接（排除本地回环）"""
+    result: List[Tuple[str, int]] = []
     try:
         for conn in psutil.Process(pid).net_connections(kind='tcp'):
             if conn.status != 'ESTABLISHED' or not conn.raddr:
@@ -206,15 +292,8 @@ def get_all_server_connections(pid: int) -> List[Tuple[str, int]]:
 def get_server_connections_fallback(pid: int) -> List[Tuple[str, int]]:
     """
     备用方案：通过 netstat 命令获取 TCP 连接（当 psutil 权限不足时使用）。
-    
-    在 Windows 上，netstat -ano 不需要管理员权限即可列出 TCP 连接。
-    返回 (remote_ip, remote_port) 列表。
-    
-    netstat -ano 输出格式 (中文/英文系统通用):
-      TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234
-      TCP    192.168.1.100:54321    180.188.16.62:10111    ESTABLISHED     8796
     """
-    result = []
+    result: List[Tuple[str, int]] = []
     try:
         output = subprocess.check_output(
             ["netstat", "-ano"], timeout=5,
@@ -222,33 +301,25 @@ def get_server_connections_fallback(pid: int) -> List[Tuple[str, int]]:
         ).decode('utf-8', errors='replace')
     except Exception:
         return result
-    
+
     pid_str = str(pid)
     for line in output.splitlines():
         line = line.strip()
         if not line or not line.endswith(pid_str):
             continue
-        
-        # 检查是否包含 ESTABLISHED 状态
         if 'ESTABLISHED' not in line.upper():
             continue
-        
+
         parts = line.split()
         if len(parts) < 5:
             continue
-        
-        # netstat -ano 格式: Proto  LocalAddress  ForeignAddress  State  PID
-        # parts[0]=TCP, parts[1]=本地地址, parts[2]=远程地址, parts[3]=状态, parts[4]=PID
+
         foreign = parts[2]
-        
         if ':' not in foreign:
             continue
-        
+
         try:
-            # 解析 IP:Port
             ip_port = str(foreign)
-            
-            # 处理 IPv6 方括号格式: [::1]:port
             if ip_port.startswith('['):
                 bracket_end = ip_port.rfind(']')
                 if bracket_end > 0 and ':' in ip_port[bracket_end:]:
@@ -257,37 +328,37 @@ def get_server_connections_fallback(pid: int) -> List[Tuple[str, int]]:
                 else:
                     continue
             else:
-                # IPv4 格式: 192.168.1.1:port
                 last_colon = ip_port.rfind(':')
                 if last_colon <= 0:
                     continue
                 ip = ip_port[:last_colon]
                 port_str = ip_port[last_colon + 1:]
-            
+
             port = int(port_str)
-            
-            # 排除本地回环
             if ip in ('127.0.0.1', '::1', '0.0.0.0', '[::1]'):
                 continue
             if ip.startswith('127.'):
                 continue
-            
             result.append((ip, port))
         except (ValueError, IndexError):
             continue
-    
     return result
 
 
 # ==================== 进程管理 ====================
-def check_process_alive(pid):
+def check_process_alive(pid: int) -> bool:
+    """检查指定 PID 进程是否存活"""
     try:
         return psutil.Process(pid).is_running()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
 
 
-def kill_process(pid):
+def kill_process(pid: int) -> bool:
+    """
+    终止指定 PID 进程。
+    先尝试 terminate()，3 秒无响应则 kill()，再失败则用 taskkill 兜底。
+    """
     try:
         proc = psutil.Process(pid)
         name = proc.name()
@@ -315,40 +386,108 @@ def kill_process(pid):
             return False
 
 
+def restart_minecraft(command: str) -> Optional[subprocess.Popen]:
+    """执行 Minecraft 重启命令，返回启动的进程对象"""
+    if not command:
+        return None
+    log.info(f"正在重启 Minecraft: {command}")
+    try:
+        proc = subprocess.Popen(
+            command, shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        log.info(f"Minecraft 重启中 (PID: {proc.pid})")
+        return proc
+    except Exception as e:
+        log.error(f"Minecraft 重启失败: {e}")
+        return None
+
+
+# ==================== Webhook 通知 ====================
+def send_webhook(url: str, message: str) -> None:
+    """发送 Webhook 通知（支持 Discord/企业微信等格式）"""
+    if not url:
+        return
+    try:
+        import urllib.request
+        data = json.dumps({"content": message}).encode('utf-8')
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+        log.info("Webhook 通知已发送")
+    except Exception as e:
+        log.warning(f"Webhook 发送失败: {e}")
+
+
+# ==================== TCP 连接工具 ====================
+def optimize_tcp_socket(sock: socket.socket, config: AppConfig) -> None:
+    """配置 TCP socket 优化选项"""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    try:
+        if sys.platform != 'win32':
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, config.tcp_keepalive_idle)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, config.tcp_keepalive_interval)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, config.tcp_keepalive_count)
+        else:
+            SIO_KEEPALIVE_VALS = 0x98000004
+            sock.ioctl(
+                SIO_KEEPALIVE_VALS,
+                (1, config.tcp_keepalive_idle * 1000, config.tcp_keepalive_interval * 1000)
+            )
+    except (OSError, AttributeError, ImportError):
+        pass
+
+
+def safe_close_socket(sock: Optional[socket.socket]) -> None:
+    """安全关闭 socket"""
+    if sock:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 # ==================== 对等连接管理器 ====================
 class PeerConnection:
     """
-    管理与对等脚本的 TCP 心跳连接。
-
-    协议设计：
-    - HEARTBEAT_MSG (ALIVE\\n): 定期心跳，刷新 last_heartbeat
-    - PEER_DOWN_MSG (PEER_DOWN\\n): 我方 MC 进程已退出，对方收到后立即杀进程
-    - SHUTDOWN_MSG (SHUTDOWN\\n): 脚本正常退出，对方可安全退出
+    管理两个脚本实例间的 TCP 心跳连接。
 
     判定对方退出的三种路径（满足任一即触发）：
-    1. 收到 PEER_DOWN_MSG 或 SHUTDOWN_MSG → 立即判定（0s 延迟）
-    2. 心跳超时（连续 HEARTBEAT_TIMEOUT 秒未收到 ALIVE）→ 兜底判定
-    3. 服务器连接断开检测（可选）→ 检测自身 MC 是否断开了服务器
+    1. 收到 PEER_DOWN 或 SHUTDOWN 消息 → 立即判定
+    2. 心跳超时（连续 heartbeat_timeout 秒未收到 ALIVE）→ 兜底判定
+    3. 服务器连接断开检测（可选）
     """
 
-    def __init__(self, port, peer_port, monitored_pid, on_peer_lost):
-        self.port = port
-        self.peer_port = peer_port
+    def __init__(self, config: AppConfig, monitored_pid: int,
+                 on_peer_lost: Callable[[], None]):
+        self.config = config
         self.monitored_pid = monitored_pid
         self.on_peer_lost = on_peer_lost
 
-        self.server_socket = None
-        self.last_heartbeat = time.time()
-        self.startup_time = time.time()
-        self.peer_ever_connected = False
-        self.running = True
-        self._conn_lock = threading.Lock()
-        self._active_socket = None
-        self._peer_lost_triggered = False
-        self._client_reconnect_backoff = RECONNECT_INTERVAL_MIN
-        self._shutting_down = False          # 标记正在优雅关闭，抑制后续错误日志
+        self.server_socket: Optional[socket.socket] = None
+        self.last_heartbeat: float = time.time()
+        self.startup_time: float = time.time()
+        self.peer_ever_connected: bool = False
+        self.running: bool = True
 
-        # 各线程
+        self._conn_lock = threading.Lock()
+        self._active_socket: Optional[socket.socket] = None
+        self._peer_lost_triggered: bool = False
+        self._client_reconnect_backoff: int = config.reconnect_interval_min
+        self._shutting_down: bool = False
+        self._psutil_permission_warned: bool = False  # 权限警告去重标记
+
+        # 线程
         self.server_thread = threading.Thread(
             target=self._run_server, daemon=True, name="ServerThread")
         self.client_thread = threading.Thread(
@@ -358,41 +497,25 @@ class PeerConnection:
         self.proc_monitor_thread = threading.Thread(
             target=self._local_process_monitor, daemon=True, name="ProcMonitorThread")
 
-    # ---------- TCP Socket 优化 ----------
-    @staticmethod
-    def _optimize_tcp_socket(sock: socket.socket):
-        """
-        TCP socket 优化：TCP_NODELAY + SO_KEEPALIVE + 平台参数。
-        """
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except OSError:
-            pass
-        try:
-            if sys.platform != 'win32':
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPIDLE)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPINTVL)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPCNT)
-            else:
-                SIO_KEEPALIVE_VALS = 0x98000004
-                sock.ioctl(
-                    SIO_KEEPALIVE_VALS,
-                    (1, TCP_KEEPIDLE * 1000, TCP_KEEPINTVL * 1000)
-                )
-        except (OSError, AttributeError, ImportError):
-            pass
+    # ---------- 活跃连接管理 ----------
+    def _try_claim_active_socket(self, sock: socket.socket) -> bool:
+        """尝试将 socket 设为活跃连接，先到先得"""
+        with self._conn_lock:
+            if self._active_socket is None and not self._peer_lost_triggered:
+                self._active_socket = sock
+                return True
+            return False
+
+    def _clear_active_socket(self, sock: Optional[socket.socket] = None) -> None:
+        """清除活跃连接"""
+        with self._conn_lock:
+            if sock is None or self._active_socket is sock:
+                self._active_socket = None
 
     # ---------- 告别消息发送 ----------
-    def _send_farewell(self, msg: bytes):
-        """
-        通过活跃 socket 发送告别消息（PEER_DOWN 或 SHUTDOWN）。
-        最多重试 3 次，每次间隔 0.5s，确保对方能收到。
-        """
-        sock = None
+    def _send_farewell(self, msg: bytes) -> None:
+        """通过活跃 socket 发送告别消息，最多重试 3 次"""
+        sock: Optional[socket.socket] = None
         with self._conn_lock:
             sock = self._active_socket
         if sock is None:
@@ -413,29 +536,9 @@ class PeerConnection:
                 else:
                     log.warning(f"发送告别消息失败: {e}")
 
-    # ---------- 活跃连接管理 ----------
-    def _try_claim_active_socket(self, sock) -> bool:
-        with self._conn_lock:
-            if self._active_socket is None and not self._peer_lost_triggered:
-                self._active_socket = sock
-                return True
-            return False
-
-    def _clear_active_socket(self, sock=None):
-        with self._conn_lock:
-            if sock is None or self._active_socket is sock:
-                self._active_socket = None
-
     # ---------- 判定对方掉线 ----------
-    def _trigger_peer_lost(self, reason: str = ""):
-        """
-        线程安全地触发 on_peer_lost，确保只执行一次。
-
-        触发来源：
-        1. 收到 PEER_DOWN_MSG → reason = "对方 MC 进程已退出"
-        2. 收到 SHUTDOWN_MSG → reason = "对方脚本正常退出"
-        3. 心跳超时 → reason = "心跳超时"
-        """
+    def _trigger_peer_lost(self, reason: str = "") -> None:
+        """线程安全地触发 peer lost 回调，确保只执行一次"""
         with self._conn_lock:
             if self._peer_lost_triggered:
                 return
@@ -447,57 +550,46 @@ class PeerConnection:
         self.on_peer_lost()
 
     # ---------- 双向心跳 ----------
-    def _start_bidirectional_heartbeat(self, sock, role_name: str):
-        """
-        在已建立的 TCP 连接上启动双向心跳。
-        先到先得抢占活跃连接，抢占失败返回 False。
-        """
+    def _start_bidirectional_heartbeat(self, sock: socket.socket,
+                                       role_name: str) -> bool:
+        """在已建立的 TCP 连接上启动双向心跳"""
         if not self._try_claim_active_socket(sock):
             log.debug(f"[{role_name}] 连接未被接纳（已有活跃连接），关闭")
             return False
 
-        self._optimize_tcp_socket(sock)
+        optimize_tcp_socket(sock, self.config)
         try:
-            sock.settimeout(HEARTBEAT_INTERVAL + 2)
+            sock.settimeout(self.config.heartbeat_interval + 2)
         except OSError:
             pass
 
         self.peer_ever_connected = True
         self.last_heartbeat = time.time()
-        self._client_reconnect_backoff = RECONNECT_INTERVAL_MIN
+        self._client_reconnect_backoff = self.config.reconnect_interval_min
         log.info(f"[{role_name}] 双向心跳已建立: {sock.getpeername()}")
 
-        def send_loop():
-            """定期发送心跳，连接断开时清理等待重连"""
+        def send_loop() -> None:
+            """定期发送心跳，连接断开时清理"""
             while self.running and not self._peer_lost_triggered:
                 with self._conn_lock:
                     cur = self._active_socket
                 if cur is not sock:
                     break
                 try:
-                    sock.sendall(HEARTBEAT_MSG)
+                    sock.sendall(Protocol.HEARTBEAT)
                 except OSError:
                     break
-                time.sleep(HEARTBEAT_INTERVAL)
+                time.sleep(self.config.heartbeat_interval)
             log.debug(f"[{role_name}] 发送线程退出")
             self._clear_active_socket(sock)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            safe_close_socket(sock)
             if self.running and not self._peer_lost_triggered:
                 log.info(f"[{role_name}] TCP 发送连接断开，将尝试重新连接...")
 
-        def recv_loop():
-            """
-            接收循环：解析 HEARTBEAT、PEER_DOWN、SHUTDOWN 三种消息。
-
-            - ALIVE\\n: 刷新 last_heartbeat
-            - PEER_DOWN\\n: 对方 MC 进程已退出 → 立即触发 _trigger_peer_lost
-            - SHUTDOWN\\n: 对方脚本正常退出 → 立即触发 _trigger_peer_lost
-            """
+        def recv_loop() -> None:
+            """接收循环：解析 HEARTBEAT / PEER_DOWN / SHUTDOWN 消息"""
             recv_buffer = b""
-            all_msgs = [HEARTBEAT_MSG, PEER_DOWN_MSG, SHUTDOWN_MSG]
+            all_msgs = Protocol.all_messages()
 
             while self.running and not self._peer_lost_triggered:
                 with self._conn_lock:
@@ -509,10 +601,10 @@ class PeerConnection:
                 except socket.timeout:
                     continue
                 except ConnectionResetError:
-                    log.warning(f"[{role_name}] TCP 连接被重置 — 代理或对端可能已断开")
+                    log.warning(f"[{role_name}] TCP 连接被重置")
                     break
                 except ConnectionAbortedError:
-                    log.warning(f"[{role_name}] TCP 连接被本地中止 — 可能是代理干扰")
+                    log.warning(f"[{role_name}] TCP 连接被本地中止")
                     break
                 except ConnectionRefusedError:
                     log.warning(f"[{role_name}] 连接被拒绝")
@@ -526,12 +618,18 @@ class PeerConnection:
                     break
 
                 if not chunk:
-                    log.warning(f"[{role_name}] 对方关闭了连接 (recv 返回空)")
+                    log.warning(f"[{role_name}] 对方关闭了连接")
                     break
 
                 recv_buffer += chunk
 
-                # 循环解析已知消息（连续处理 buffer 中可能的多条消息）
+                # 限制接收缓冲区大小，防止内存溢出
+                if len(recv_buffer) > self.config.recv_buffer_max:
+                    log.warning(f"[{role_name}] 接收缓冲区超限 ({len(recv_buffer)} > "
+                                f"{self.config.recv_buffer_max})，断开连接")
+                    break
+
+                # 循环解析所有已知消息
                 parsed_any = True
                 while parsed_any:
                     parsed_any = False
@@ -541,27 +639,23 @@ class PeerConnection:
                             recv_buffer = recv_buffer[idx + len(msg):]
                             parsed_any = True
 
-                            if msg is HEARTBEAT_MSG:
+                            if msg == Protocol.HEARTBEAT:
                                 self.last_heartbeat = time.time()
-                            elif msg is PEER_DOWN_MSG:
+                            elif msg == Protocol.PEER_DOWN:
                                 log.warning(f"[{role_name}] 收到 PEER_DOWN: 对方 MC 进程已退出！")
                                 self._shutting_down = True
                                 self._trigger_peer_lost("对方 MC 进程已退出 (PEER_DOWN)")
                                 break
-                            elif msg is SHUTDOWN_MSG:
+                            elif msg == Protocol.SHUTDOWN:
                                 log.info(f"[{role_name}] 收到 SHUTDOWN: 对方脚本正常退出")
                                 self._shutting_down = True
                                 self._trigger_peer_lost("对方脚本正常退出 (SHUTDOWN)")
                                 break
-                            # 继续检查 buffer 中剩余数据
-                            break  # 跳出 for 循环，重新 while 检测是否有更多消息
+                            break
 
             log.debug(f"[{role_name}] 接收线程退出 (buffer 残留 {len(recv_buffer)} bytes)")
             self._clear_active_socket(sock)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            safe_close_socket(sock)
             if self.running and not self._peer_lost_triggered:
                 log.info(f"[{role_name}] TCP 接收连接断开，将尝试重新连接...")
 
@@ -572,25 +666,25 @@ class PeerConnection:
         return True
 
     # ---------- 服务端 ----------
-    def _run_server(self):
+    def _run_server(self) -> None:
+        """服务端监听循环"""
         while self.running:
+            sock: Optional[socket.socket] = None
             try:
-                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.server_socket.bind((LOCALHOST, self.port))
-                self.server_socket.listen(1)
-                self.server_socket.settimeout(5)
-                log.info(f"服务端已启动，等待对方连接: {LOCALHOST}:{self.port}")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((LOCALHOST, self.config.port))
+                sock.listen(1)
+                sock.settimeout(5)
+                self.server_socket = sock
+                log.info(f"服务端已启动，等待对方连接: {LOCALHOST}:{self.config.port}")
 
                 while self.running:
                     try:
-                        conn, addr = self.server_socket.accept()
-                        log.info(f"对方已连接（来自: {addr}）-> 尝试启动双向心跳（Server 侧）")
+                        conn, addr = sock.accept()
+                        log.info(f"对方已连接（来自: {addr}）-> 启动双向心跳（Server 侧）")
                         if not self._start_bidirectional_heartbeat(conn, "Server"):
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
+                            safe_close_socket(conn)
                     except socket.timeout:
                         continue
                     except Exception as e:
@@ -599,80 +693,69 @@ class PeerConnection:
                         break
             except OSError as e:
                 if self.running:
-                    log.error(f"服务端启动失败 (端口 {self.port}): {e}")
+                    log.error(f"服务端启动失败 (端口 {self.config.port}): {e}")
                     time.sleep(5)
             finally:
-                if self.server_socket:
-                    try:
-                        self.server_socket.close()
-                    except Exception:
-                        pass
-                    self.server_socket = None
+                self.server_socket = None
+                safe_close_socket(sock)
 
     # ---------- 客户端 ----------
-    def _run_client(self):
+    def _run_client(self) -> None:
+        """客户端重连循环"""
         backoff = self._client_reconnect_backoff
         while self.running:
-            sock = None
+            sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
-                sock.connect((LOCALHOST, self.peer_port))
-                log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port} -> 尝试启动双向心跳（Client 侧）")
+                sock.connect((LOCALHOST, self.config.peer_port))
+                log.info(f"已连接到对方: {LOCALHOST}:{self.config.peer_port} -> "
+                         f"启动双向心跳（Client 侧）")
                 if not self._start_bidirectional_heartbeat(sock, "Client"):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+                    safe_close_socket(sock)
                     sock = None
                     while self.running and not self._peer_lost_triggered:
                         with self._conn_lock:
                             if self._active_socket is None:
                                 break
-                        time.sleep(HEARTBEAT_INTERVAL)
-                    backoff = RECONNECT_INTERVAL_MIN
+                        time.sleep(self.config.heartbeat_interval)
+                    backoff = self.config.reconnect_interval_min
                     continue
+
                 while self.running:
                     with self._conn_lock:
                         if self._active_socket is sock:
-                            time.sleep(HEARTBEAT_INTERVAL)
+                            time.sleep(self.config.heartbeat_interval)
                             continue
                     break
-                backoff = RECONNECT_INTERVAL_MIN
+                backoff = self.config.reconnect_interval_min
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
                 elapsed = time.time() - self.startup_time
-                if elapsed < STARTUP_GRACE_PERIOD:
+                if elapsed < self.config.startup_grace_period:
                     log.info(f"等待对方实例启动... "
-                             f"({LOCALHOST}:{self.peer_port} 尚未就绪，"
-                             f"宽限期剩余 {STARTUP_GRACE_PERIOD - int(elapsed)}s)")
+                             f"({LOCALHOST}:{self.config.peer_port} 尚未就绪，"
+                             f"宽限期剩余 {self.config.startup_grace_period - int(elapsed)}s)")
                 else:
-                    log.warning(f"连接对方失败 ({LOCALHOST}:{self.peer_port}): {e}")
+                    log.warning(f"连接对方失败 ({LOCALHOST}:{self.config.peer_port}): {e}")
                 log.info(f"{backoff}秒后重试...")
             finally:
-                if sock:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
+                safe_close_socket(sock)
                 if self.running and not self._peer_lost_triggered:
                     time.sleep(backoff)
-                    backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
+                    backoff = min(backoff * 2, self.config.reconnect_interval_max)
 
-    # ---------- 心跳超时检测（兜底判定）----------
-    def _heartbeat_checker(self):
-        """
-        心跳超时是判定对方掉线的兜底机制。
-        正常情况应该通过 PEER_DOWN/SHUTDOWN 消息即时判定，
-        心跳超时仅在连接意外断开（进程崩溃、网络断开）时生效。
-        """
+    # ---------- 心跳超时检测 ----------
+    def _heartbeat_checker(self) -> None:
+        """心跳超时是判定对方掉线的兜底机制"""
         while self.running and not self._peer_lost_triggered:
             time.sleep(1)
             elapsed = time.time() - self.last_heartbeat
             since_startup = time.time() - self.startup_time
 
-            if elapsed > HEARTBEAT_TIMEOUT:
-                if since_startup < STARTUP_GRACE_PERIOD and not self.peer_ever_connected:
-                    remain = STARTUP_GRACE_PERIOD - int(since_startup)
+            if elapsed > self.config.heartbeat_timeout:
+                if since_startup < self.config.startup_grace_period and \
+                        not self.peer_ever_connected:
+                    remain = self.config.startup_grace_period - int(since_startup)
                     if int(since_startup) % 10 == 0:
                         log.info(f"[{int(since_startup)}s] 等待对方实例启动中... "
                                  f"(宽限期剩余 {remain}s)")
@@ -683,65 +766,224 @@ class PeerConnection:
                 self._trigger_peer_lost("心跳超时（对方可能崩溃或网络断开）")
 
     # ---------- 本地进程监控 ----------
-    def _local_process_monitor(self):
-        """
-        监控本地 Minecraft 进程存活状态。
-        一旦检测到本地 MC 进程退出，立即通过活跃 socket
-        发送 PEER_DOWN_MSG 通知对方，确保对方即时响应。
-        """
+    def _local_process_monitor(self) -> None:
+        """监控本地 Minecraft 进程存活状态，退出时通知对方"""
         while self.running:
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(self.config.heartbeat_interval)
             if not check_process_alive(self.monitored_pid):
                 log.warning(f"本地 Minecraft 进程已退出 (PID: {self.monitored_pid})！")
                 log.warning("正在通知对方...")
                 self._shutting_down = True
-                # 发送 PEER_DOWN 让对方立即知晓（不等待心跳超时）
-                self._send_farewell(PEER_DOWN_MSG)
+                self._send_farewell(Protocol.PEER_DOWN)
                 self._clear_active_socket()
                 self.running = False
                 break
 
     # ---------- 启动 / 停止 ----------
-    def start(self):
-        log.info(f"本实例监听端口: {self.port}")
-        log.info(f"对方实例端口: {self.peer_port}")
+    def start(self) -> None:
+        """启动所有通信线程"""
+        log.info(f"本实例监听端口: {self.config.port}")
+        log.info(f"对方实例端口: {self.config.peer_port}")
         log.info(f"监控进程 PID: {self.monitored_pid}")
         self.server_thread.start()
         self.client_thread.start()
         self.checker_thread.start()
         self.proc_monitor_thread.start()
 
-    def stop(self, graceful=True):
+    def stop(self, graceful: bool = True) -> None:
         """
         停止连接管理器。
 
-        graceful=True:  发送 SHUTDOWN_MSG 通知对方（优雅退出）
-        graceful=False: 直接关闭（由 on_peer_lost 触发的强制退出）
+        graceful=True:  发送 SHUTDOWN 通知对方（手动退出）
+        graceful=False: 直接关闭（对方掉线触发）
         """
         self._shutting_down = True
         if graceful and not self._peer_lost_triggered:
-            self._send_farewell(SHUTDOWN_MSG)
+            self._send_farewell(Protocol.SHUTDOWN)
         self.running = False
         self._clear_active_socket()
         if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
+            safe_close_socket(self.server_socket)
             self.server_socket = None
 
+    @property
+    def peer_lost_triggered(self) -> bool:
+        """是否已触发掉线处理"""
+        return self._peer_lost_triggered
 
-# ==================== 主程序 ====================
-def main():
-    global HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT
 
+# ==================== 服务器连接监控 ====================
+class ServerConnectionMonitor:
+    """监控 Minecraft 进程的服务器连接状态"""
+
+    def __init__(self, config: AppConfig, peer: PeerConnection,
+                 target_pid: int, on_disconnect: Callable[[], None]):
+        self.config = config
+        self.peer = peer
+        self.target_pid = target_pid
+        self.on_disconnect = on_disconnect
+        self._psutil_permission_warned = False
+
+    def _check_with_fallback(self, pid: int) -> Optional[Tuple[str, int]]:
+        """多级检测：psutil → netstat 回退"""
+        result = get_minecraft_server_connection(pid)
+        if result is not None:
+            return result
+
+        try:
+            all_conns = get_all_server_connections(pid)
+            if len(all_conns) > 0:
+                return None
+        except Exception:
+            pass
+
+        if not self._psutil_permission_warned:
+            log.info("[服务器检测] psutil 连接检测权限不足，启用 netstat 备用方案")
+            self._psutil_permission_warned = True
+
+        fallback = get_server_connections_fallback(pid)
+        for ip, port in fallback:
+            if is_likely_game_port(port):
+                return (ip, port)
+        return None
+
+    def run(self) -> None:
+        """服务器连接监控主循环"""
+        log.info(f"[服务器检测] 监控线程已启动 (PID: {self.target_pid}, "
+                 f"间隔: {self.config.server_check_interval}s)")
+        consecutive_disconnects = 0
+
+        while self.peer.running:
+            time.sleep(self.config.server_check_interval)
+            if not check_process_alive(self.target_pid):
+                break
+
+            srv = self._check_with_fallback(self.target_pid)
+            if srv is None:
+                consecutive_disconnects += 1
+                log.warning(
+                    f"[服务器检测] 未检测到游戏服务器连接 "
+                    f"({consecutive_disconnects}/{self.config.server_check_consecutive}) "
+                    f"(PID: {self.target_pid})"
+                )
+                if consecutive_disconnects >= self.config.server_check_consecutive:
+                    log.warning(f"[服务器检测] 客户端已断开服务器连接 (PID: {self.target_pid})")
+                    self.on_disconnect()
+                    break
+            else:
+                if consecutive_disconnects > 0:
+                    log.info(f"[服务器检测] 服务器连接已恢复: {srv[0]}:{srv[1]}")
+                consecutive_disconnects = 0
+
+
+# ==================== 主应用程序 ====================
+class MonitorApp:
+    """Minecraft AFK 挂机互保脚本主程序"""
+
+    def __init__(self, config: AppConfig, target_pid: int):
+        self.config = config
+        self.target_pid = target_pid
+        self.peer: Optional[PeerConnection] = None
+        self._shutdown_event = threading.Event()
+
+    def _on_peer_lost(self) -> None:
+        """对方掉线回调"""
+        log.warning("=" * 50)
+        log.warning("对方客户端已掉线！")
+        log.warning(f"正在结束本地 MC 进程 (PID: {self.target_pid}) ...")
+        log.warning("=" * 50)
+
+        send_webhook(self.config.webhook_url,
+                     f"[AFK Monitor] 对方掉线，正在终止本地 MC 进程 (PID: {self.target_pid})")
+
+        kill_process(self.target_pid)
+        log.info("本地 MC 进程已结束")
+
+        if self.config.restart_command:
+            log.info("正在尝试自动重启 Minecraft...")
+            restart_minecraft(self.config.restart_command)
+
+        self._shutdown_event.set()
+
+    def _on_server_disconnect(self) -> None:
+        """服务器断开连接回调"""
+        log.warning("=" * 50)
+        log.warning("检测到本地 MC 客户端已断开服务器连接！")
+        log.warning(f"正在结束本地 MC 进程 (PID: {self.target_pid}) ...")
+        log.warning("=" * 50)
+
+        send_webhook(self.config.webhook_url,
+                     f"[AFK Monitor] 服务器连接断开，正在终止本地 MC 进程 (PID: {self.target_pid})")
+
+        if self.peer:
+            self.peer._shutting_down = True
+            self.peer._send_farewell(Protocol.PEER_DOWN)
+        kill_process(self.target_pid)
+        log.info("本地 MC 进程已结束")
+
+        if self.config.restart_command:
+            log.info("正在尝试自动重启 Minecraft...")
+            restart_minecraft(self.config.restart_command)
+
+        self._shutdown_event.set()
+
+    def _signal_handler(self, sig: int, frame) -> None:
+        """信号处理：Ctrl+C 优雅退出"""
+        log.info("\n收到退出信号 (Ctrl+C)，正在通知对方并关闭...")
+        if self.peer:
+            self.peer.stop(graceful=True)
+        self._shutdown_event.set()
+
+    def run(self) -> None:
+        """运行监控主循环"""
+        # 注册信号处理
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        # 创建对等连接管理器
+        self.peer = PeerConnection(
+            config=self.config,
+            monitored_pid=self.target_pid,
+            on_peer_lost=self._on_peer_lost
+        )
+        self.peer.start()
+
+        # 启动服务器连接监控（默认启用）
+        if not self.config.no_check_server:
+            srv_monitor = ServerConnectionMonitor(
+                config=self.config,
+                peer=self.peer,
+                target_pid=self.target_pid,
+                on_disconnect=self._on_server_disconnect
+            )
+            threading.Thread(
+                target=srv_monitor.run,
+                daemon=True,
+                name="ServerCheckThread"
+            ).start()
+
+        # 主循环
+        try:
+            while not self._shutdown_event.is_set():
+                self._shutdown_event.wait(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if self.peer:
+                self.peer.stop(graceful=True)
+            log.info("脚本已退出。")
+
+
+# ==================== 入口 ====================
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Minecraft AFK 挂机互保脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例用法:
-  实例A: python afk_monitor.py --port 18888 --peer-port 18889 --auto --auto-index 0
-  实例B: python afk_monitor.py --port 18889 --peer-port 18888 --auto --auto-index 1
-  手动:  python afk_monitor.py --port 18888 --peer-port 18889 --pid <PID>""")
+  实例A: python afk_monitor.py --instance a
+  实例B: python afk_monitor.py --instance b
+  手动:  python afk_monitor.py --port 18888 --peer-port 18889 --pid <PID>
+  列表:  python afk_monitor.py --list""")
     parser.add_argument("--port", type=int, default=None,
                         help="本实例监听端口号")
     parser.add_argument("--peer-port", type=int, default=None,
@@ -751,24 +993,33 @@ def main():
     parser.add_argument("--auto", action="store_true", default=False,
                         help="全自动检测 Minecraft 进程，配合 --auto-index 使用")
     parser.add_argument("--auto-index", type=int, default=0,
-                        help="自动模式下选择第几个进程（0=第1个, 1=第2个, 按PID升序，默认0）")
+                        help="自动模式下选择第几个进程（0=第1个, 按PID升序，默认0）")
+    parser.add_argument("--instance", type=str, default=None, choices=['a', 'b'],
+                        help="使用 config.json 中预设的实例快捷配置 (a/b)")
+    parser.add_argument("--config", type=str, default="config.json",
+                        help="配置文件路径（默认: config.json）")
     parser.add_argument("--list", action="store_true", default=False,
                         help="列出所有 Minecraft 进程后退出")
-    parser.add_argument("--heartbeat-interval", type=int, default=HEARTBEAT_INTERVAL,
-                        help=f"心跳间隔秒数（默认: {HEARTBEAT_INTERVAL}）")
-    parser.add_argument("--heartbeat-timeout", type=int, default=HEARTBEAT_TIMEOUT,
-                        help=f"心跳超时秒数（默认: {HEARTBEAT_TIMEOUT}）")
+    parser.add_argument("--heartbeat-interval", type=int, default=-1,
+                        help="心跳间隔秒数（覆盖配置文件）")
+    parser.add_argument("--heartbeat-timeout", type=int, default=-1,
+                        help="心跳超时秒数（覆盖配置文件）")
+    parser.add_argument("--server-check-interval", type=int, default=-1,
+                        help="服务器连接检测间隔秒数（覆盖配置文件）")
     parser.add_argument("--no-check-server", action="store_true", default=False,
-                        help="禁用服务器连接断开检测（默认启用）")
-    parser.add_argument("--server-check-interval", type=int, default=10,
-                        help="服务器连接检测间隔秒数（默认: 10）")
+                        help="禁用服务器连接断开检测")
+    parser.add_argument("--log-file", type=str, default="",
+                        help="日志文件路径（覆盖配置文件）")
+    parser.add_argument("--webhook-url", type=str, default="",
+                        help="Webhook 通知地址（覆盖配置文件）")
+    parser.add_argument("--restart-command", type=str, default="",
+                        help="掉线后自动重启 Minecraft 的完整命令行")
 
     args = parser.parse_args()
-    HEARTBEAT_INTERVAL = args.heartbeat_interval
-    HEARTBEAT_TIMEOUT = args.heartbeat_timeout
 
-    # --list 模式
+    # --list 模式（不需要配置文件）
     if args.list:
+        setup_logging()
         processes = find_minecraft_processes()
         if not processes:
             print("未检测到任何 Minecraft 进程。")
@@ -781,13 +1032,21 @@ def main():
                 print(f"  命令行: {cmd_display}\n")
         sys.exit(0)
 
-    if args.port is None or args.peer_port is None:
-        log.error("--port 和 --peer-port 参数是必需的！")
-        log.error("用法: python afk_monitor.py --port <本机端口> --peer-port <对方端口> "
-                  "[--auto --auto-index N]")
-        sys.exit(1)
+    # 加载配置
+    config = AppConfig.from_args(args)
 
-    # ========== PID 自动检测 ==========
+    # 配置日志
+    setup_logging(log_file=config.log_file if config.log_file else None)
+
+    # 验证端口
+    if config.port is None or config.peer_port is None:
+        if not args.instance and (args.port is None or args.peer_port is None):
+            log.error("--port 和 --peer-port 参数是必需的！")
+            log.error("或使用 --instance a / --instance b 快捷配置")
+            log.error("或确保 config.json 存在并配置了 instance_a / instance_b")
+            sys.exit(1)
+
+    # PID 自动检测
     target_pid = args.pid
 
     if args.auto and target_pid is not None:
@@ -810,7 +1069,7 @@ def main():
         for i, (pid, name, _) in enumerate(processes):
             log.info(f"  [{i}] PID: {pid} | {name}")
 
-        idx = args.auto_index
+        idx = config.auto_index
         if idx < 0 or idx >= len(processes):
             log.error(f"--auto-index {idx} 超出范围！")
             log.error(f"有效范围: 0 ~ {len(processes)-1}")
@@ -833,7 +1092,7 @@ def main():
 
     proc = psutil.Process(target_pid)
     log.info(f"监控进程: {proc.name()} (PID: {target_pid})")
-    log.info(f"心跳间隔: {HEARTBEAT_INTERVAL}s, 心跳超时: {HEARTBEAT_TIMEOUT}s")
+    log.info(f"心跳间隔: {config.heartbeat_interval}s, 心跳超时: {config.heartbeat_timeout}s")
 
     # 服务器连接状态
     log.info("-" * 40)
@@ -847,135 +1106,18 @@ def main():
     if all_c:
         log.info(f"  检测到 {len(all_c)} 个远程连接（含认证/API 等）:")
         for ip, port in all_c:
-            tag = " [游戏]" if _is_likely_game_port(port) else " [非游戏]"
+            tag = " [游戏]" if is_likely_game_port(port) else " [非游戏]"
             log.info(f"    - {ip}:{port}{tag}")
     log.info("-" * 40)
-    if args.no_check_server:
-        log.info("服务器连接检测已禁用 (使用 --no-check-server 禁用)")
+    if config.no_check_server:
+        log.info("服务器连接检测已禁用")
     else:
-        log.info(f"服务器连接检测已启用 (间隔: {args.server_check_interval}s)")
+        log.info(f"服务器连接检测已启用 (间隔: {config.server_check_interval}s)")
     log.info("")
 
-    # ========== 回调函数 ==========
-    def on_peer_lost():
-        log.warning("=" * 50)
-        log.warning("对方客户端已掉线！")
-        log.warning(f"正在结束本地 MC 进程 (PID: {target_pid}) ...")
-        log.warning("=" * 50)
-        kill_process(target_pid)
-        log.info("本地 MC 进程已结束，脚本即将退出。")
-        os._exit(0)
-
-    def on_server_disconnect():
-        log.warning("=" * 50)
-        log.warning("检测到本地 MC 客户端已断开服务器连接！")
-        log.warning(f"正在结束本地 MC 进程 (PID: {target_pid}) ...")
-        log.warning("=" * 50)
-        # 先通知对方我方即将退出
-        peer._shutting_down = True
-        peer._send_farewell(PEER_DOWN_MSG)
-        kill_process(target_pid)
-        log.info("本地 MC 进程已结束，脚本即将退出。")
-        os._exit(0)
-
-    # ========== 创建连接管理器 ==========
-    peer = PeerConnection(
-        port=args.port,
-        peer_port=args.peer_port,
-        monitored_pid=target_pid,
-        on_peer_lost=on_peer_lost)
-
-    def signal_handler(sig, frame):
-        log.info("\n收到退出信号 (Ctrl+C)，正在通知对方并关闭...")
-        peer.stop(graceful=True)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    peer.start()
-
-    # ========== 服务器连接监控（默认启用）==========
-    if not args.no_check_server:
-        _psutil_permission_warned = [False]  # 用列表包装以支持闭包修改
-        
-        def _check_server_connection_with_fallback(pid):
-            """
-            多级检测服务器连接状态：
-            1. 优先使用 psutil（带游戏端口过滤）
-            2. psutil 权限不足时回退到 netstat 命令
-            3. 两者都失败时记录警告但不误判
-            """
-            # 第一级：psutil + 端口过滤
-            result = get_minecraft_server_connection(pid)
-            if result is not None:
-                return result
-            
-            # 检查是否是 psutil 权限问题（AccessDenied 导致空结果）
-            # 通过尝试获取进程列表来判断是否完全无权限
-            try:
-                all_conns = get_all_server_connections(pid)
-                # 如果 psutil 能获取到连接列表但经过滤后为空，说明确实没有游戏连接
-                # 但如果 psutil 返回空列表（可能权限不足），需要 netstat 验证
-                if len(all_conns) > 0:
-                    # psutil 能正常获取连接，只是没有游戏端口连接 → 确实断开了
-                    return None
-            except Exception:
-                pass
-            
-            # 第二级：netstat 回退方案（Windows 普通用户可用）
-            if not _psutil_permission_warned[0]:
-                log.info("[服务器检测] psutil 连接检测权限不足，启用 netstat 备用方案")
-                _psutil_permission_warned[0] = True
-            
-            fallback = get_server_connections_fallback(pid)
-            for ip, port in fallback:
-                if _is_likely_game_port(port):
-                    return (ip, port)
-            
-            # netstat 也查不到游戏连接 → 确认断开
-            return None
-        
-        def server_monitor(pid, interval, peer_obj, cb):
-            log.info(f"[服务器检测] 监控线程已启动 (PID: {pid}, 间隔: {interval}s)")
-            consecutive_disconnects = 0  # 连续断开计数，防止误判
-            max_consecutive = 2          # 连续2次检测到断开才确认
-            
-            while peer_obj.running:
-                time.sleep(interval)
-                if not check_process_alive(pid):
-                    break
-                
-                srv = _check_server_connection_with_fallback(pid)
-                if srv is None:
-                    consecutive_disconnects += 1
-                    log.warning(
-                        f"[服务器检测] 未检测到游戏服务器连接 "
-                        f"({consecutive_disconnects}/{max_consecutive}) (PID: {pid})"
-                    )
-                    if consecutive_disconnects >= max_consecutive:
-                        log.warning(f"[服务器检测] 客户端已断开服务器连接 (PID: {pid})")
-                        cb()
-                        break
-                else:
-                    if consecutive_disconnects > 0:
-                        log.info(f"[服务器检测] 服务器连接已恢复: {srv[0]}:{srv[1]}")
-                    consecutive_disconnects = 0
-
-        threading.Thread(
-            target=server_monitor,
-            args=(target_pid, args.server_check_interval, peer, on_server_disconnect),
-            daemon=True, name="ServerCheckThread").start()
-
-    # ========== 主循环 ==========
-    try:
-        while peer.running:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        peer.stop(graceful=True)
-        log.info("脚本已退出。")
+    # 启动主程序
+    app = MonitorApp(config, target_pid)
+    app.run()
 
 
 if __name__ == "__main__":
