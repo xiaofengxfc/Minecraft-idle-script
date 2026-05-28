@@ -271,16 +271,17 @@ class PeerConnection:
             pass
 
     # ---------- 活跃连接管理 ----------
-    def _set_active_socket(self, sock):
-        """设置活跃 socket，如果已有则关闭旧的（保留新连接）"""
+    def _try_claim_active_socket(self, sock) -> bool:
+        """
+        原子「先到先得」抢占活跃连接。
+        返回 True 表示成功抢占，调用方可以启动双向心跳；
+        返回 False 表示已被其他连接抢占，调用方应关闭 sock。
+        """
         with self._conn_lock:
-            old = self._active_socket
-            self._active_socket = sock
-            if old and old is not sock:
-                try:
-                    old.close()
-                except Exception:
-                    pass
+            if self._active_socket is None and not self._peer_lost_triggered:
+                self._active_socket = sock
+                return True
+            return False
 
     def _clear_active_socket(self, sock=None):
         """清除活跃 socket（仅当匹配时清除）"""
@@ -308,7 +309,15 @@ class PeerConnection:
         """
         在已建立的 TCP 连接上启动双向心跳。
         role_name: "Server" 或 "Client"，仅用于日志。
+
+        返回 True 表示成功启动心跳（抢占到活跃连接），
+        返回 False 表示已被另一条连接先抢占，调用方应关闭 sock。
         """
+        # 先到先得：原子抢占活跃连接
+        if not self._try_claim_active_socket(sock):
+            log.debug(f"[{role_name}] 连接 {sock.getpeername()} 未被接纳（已有活跃连接），关闭")
+            return False
+
         # 先优化 TCP socket（NODELAY + Keepalive），再开始心跳
         self._optimize_tcp_socket(sock)
         try:
@@ -317,7 +326,6 @@ class PeerConnection:
             pass
 
         self.peer_ever_connected = True
-        self._set_active_socket(sock)
         self.last_heartbeat = time.time()
         self._client_reconnect_backoff = RECONNECT_INTERVAL_MIN  # 重置退避
         log.info(f"[{role_name}] 双向心跳已建立: {sock.getpeername()}")
@@ -418,6 +426,7 @@ class PeerConnection:
                          name=f"HBSend-{role_name}").start()
         threading.Thread(target=recv_loop, daemon=True,
                          name=f"HBRecv-{role_name}").start()
+        return True
 
     # ---------- 服务端 ----------
     def _run_server(self):
@@ -433,8 +442,13 @@ class PeerConnection:
                 while self.running:
                     try:
                         conn, addr = self.server_socket.accept()
-                        log.info(f"对方已连接（来自: {addr}）-> 启动双向心跳（Server 侧）")
-                        self._start_bidirectional_heartbeat(conn, "Server")
+                        log.info(f"对方已连接（来自: {addr}）-> 尝试启动双向心跳（Server 侧）")
+                        if not self._start_bidirectional_heartbeat(conn, "Server"):
+                            # 心跳已被 Client 侧先抢占，关闭此 Server 连接
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
                     except socket.timeout:
                         continue
                     except Exception as e:
@@ -462,9 +476,24 @@ class PeerConnection:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
                 sock.connect((LOCALHOST, self.peer_port))
-                log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port} -> 启动双向心跳（Client 侧）")
-                self._start_bidirectional_heartbeat(sock, "Client")
-                # 双向心跳线程接管后，客户端连接循环等待直到连接断开
+                log.info(f"已连接到对方: {LOCALHOST}:{self.peer_port} -> 尝试启动双向心跳（Client 侧）")
+                if not self._start_bidirectional_heartbeat(sock, "Client"):
+                    # 心跳已被 Server 侧先抢占，关闭此 Client 连接
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                    # 不 sleep 重试，因为 Server 侧已有活跃连接在工作
+                    # 直接等待直到活跃连接断开，再重新进入连接循环
+                    while self.running and not self._peer_lost_triggered:
+                        with self._conn_lock:
+                            if self._active_socket is None:
+                                break
+                        time.sleep(HEARTBEAT_INTERVAL)
+                    backoff = RECONNECT_INTERVAL_MIN
+                    continue
+                # 心跳启动成功，等待直到活跃连接断开
                 while self.running:
                     with self._conn_lock:
                         if self._active_socket is sock:
@@ -488,7 +517,7 @@ class PeerConnection:
                         sock.close()
                     except Exception:
                         pass
-                if self.running:
+                if self.running and not self._peer_lost_triggered:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, RECONNECT_INTERVAL_MAX)
 
