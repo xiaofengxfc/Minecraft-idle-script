@@ -20,7 +20,7 @@ echo.
 echo 正在从 config.json 加载实例 A 配置...
 echo.
 if not exist "logs" mkdir "logs"
-set LOG_FILE=logs\crash_instance_a_%date:~0,4%%date:~5,2%%date:~8,2%_%time:~0,2%%time:~3,2%%time:~6,2%.log
-set LOG_FILE=%LOG_FILE: =0%
-python afk_monitor.py --instance a --auto 2>"%LOG_FILE%"
+for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value') do set "DT=%%I"
+set LOG_FILE=logs\crash_instance_a_%DT:~0,8%_%DT:~8,6%.log
+python afk_monitor.py --instance a --auto >"%LOG_FILE%" 2>&1
 pause
