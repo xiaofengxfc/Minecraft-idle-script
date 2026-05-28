@@ -30,11 +30,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 # ==================== 报错日志模块 ====================
 try:
-    from error_logger import setup_error_logging, shutdown_error_logging, get_log_file_path
+    from error_logger import setup_error_logging, shutdown_error_logging, get_log_file_path, write_error_to_log
 except ImportError:
     setup_error_logging = None
     shutdown_error_logging = None
     get_log_file_path = None
+    write_error_to_log = None
 
 # ==================== 日志配置 ====================
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
@@ -47,7 +48,25 @@ def setup_logging(log_file: Optional[str] = None, level: int = logging.INFO):
     """配置控制台和文件日志输出"""
     logger = logging.getLogger("afk_monitor")
     logger.setLevel(level)
+
+    # 保存报错日志系统的 FileHandler（避免被 clear 误删）
+    error_log_handlers = []
+    if get_log_file_path:
+        try:
+            error_path = str(get_log_file_path())
+            for h in logger.handlers:
+                if (isinstance(h, logging.FileHandler)
+                        and hasattr(h, 'baseFilename')
+                        and h.baseFilename == error_path):
+                    error_log_handlers.append(h)
+        except Exception:
+            pass
+
     logger.handlers.clear()
+
+    # 重新添加报错日志 handler（确保 log.error() 等信息同步写入报错日志文件）
+    for h in error_log_handlers:
+        logger.addHandler(h)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
@@ -62,7 +81,22 @@ def setup_logging(log_file: Optional[str] = None, level: int = logging.INFO):
             logger.warning(f"无法创建日志文件 {log_file}: {e}")
 
 
+
 # ==================== 自动安装依赖 ====================
+def _exit_with_error(message: str) -> None:
+    """
+    将错误消息写入报错日志文件后退出。
+    如果报错日志系统未初始化，仅打印日志并退出。
+    """
+    log.error(message)
+    if write_error_to_log:
+        try:
+            write_error_to_log(message, level="ERROR")
+        except Exception:
+            pass
+    sys.exit(1)
+
+
 def ensure_psutil():
     """确保 psutil 已安装，否则自动安装"""
     try:
@@ -80,9 +114,7 @@ def ensure_psutil():
             import psutil  # noqa: F811
             return psutil
         except Exception as e:
-            log.error(f"psutil 安装失败: {e}")
-            log.error("请手动执行: pip install psutil")
-            sys.exit(1)
+            _exit_with_error(f"psutil 安装失败: {e}\n请手动执行: pip install psutil")
 
 
 psutil = ensure_psutil()
@@ -1059,10 +1091,11 @@ def main() -> None:
     # 验证端口
     if config.port is None or config.peer_port is None:
         if not args.instance and (args.port is None or args.peer_port is None):
-            log.error("--port 和 --peer-port 参数是必需的！")
-            log.error("或使用 --instance a / --instance b 快捷配置")
-            log.error("或确保 config.json 存在并配置了 instance_a / instance_b")
-            sys.exit(1)
+            _exit_with_error(
+                "--port 和 --peer-port 参数是必需的！\n"
+                "或使用 --instance a / --instance b 快捷配置\n"
+                "或确保 config.json 存在并配置了 instance_a / instance_b"
+            )
 
     # PID 自动检测
     target_pid = args.pid
@@ -1082,9 +1115,10 @@ def main() -> None:
         processes = find_minecraft_processes()
 
         if not processes:
-            log.error("未检测到任何 Minecraft 进程！")
-            log.error("请确保 Minecraft 客户端已启动，然后重新运行。")
-            sys.exit(1)
+            _exit_with_error(
+                "未检测到任何 Minecraft 进程！\n"
+                "请确保 Minecraft 客户端已启动，然后重新运行。"
+            )
 
         log.info(f"检测到 {len(processes)} 个 Minecraft 进程:")
         for i, (pid, name, _) in enumerate(processes):
@@ -1092,24 +1126,27 @@ def main() -> None:
 
         idx = config.auto_index
         if idx < 0 or idx >= len(processes):
-            log.error(f"--auto-index {idx} 超出范围！")
-            log.error(f"有效范围: 0 ~ {len(processes)-1}")
-            log.error("提示: 实例A 用 --auto-index 0，实例B 用 --auto-index 1")
-            sys.exit(1)
+            _exit_with_error(
+                f"--auto-index {idx} 超出范围！\n"
+                f"有效范围: 0 ~ {len(processes) - 1}\n"
+                "提示: 实例A 用 --auto-index 0，实例B 用 --auto-index 1"
+            )
 
         target_pid = processes[idx][0]
         log.info(f"✓ 自动绑定: --auto-index={idx} -> PID {target_pid} ({processes[idx][1]})")
         log.info("=" * 50 + "\n")
 
     if target_pid is None:
-        log.error("未指定要监控的进程！")
-        log.error("请使用 --instance a/b 或 --auto --auto-index 0 或 --pid <PID>")
-        sys.exit(1)
+        _exit_with_error(
+            "未指定要监控的进程！\n"
+            "请使用 --instance a/b 或 --auto --auto-index 0 或 --pid <PID>"
+        )
 
     if not check_process_alive(target_pid):
-        log.error(f"进程 PID {target_pid} 不存在或无法访问！")
-        log.error("提示: 使用 --list 查看当前所有 MC 进程。")
-        sys.exit(1)
+        _exit_with_error(
+            f"进程 PID {target_pid} 不存在或无法访问！\n"
+            "提示: 使用 --list 查看当前所有 MC 进程。"
+        )
 
     proc = psutil.Process(target_pid)
     log.info(f"监控进程: {proc.name()} (PID: {target_pid})")

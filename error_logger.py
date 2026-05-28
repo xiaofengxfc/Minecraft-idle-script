@@ -86,6 +86,23 @@ def get_log_file_path() -> Optional[Path]:
     return _log_file_path
 
 
+def write_error_to_log(message: str, level: str = "ERROR") -> None:
+    """
+    手动向报错日志文件写入一条错误消息。
+    用于记录被 try/except 处理但仍然导致脚本退出的错误。
+
+    参数:
+        message: 错误消息文本
+        level: 日志级别 (ERROR/WARNING/CRITICAL/INFO)
+    """
+    try:
+        now = datetime.now(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        with open(_log_file_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{now}] [{level}] {message}\n")
+    except Exception:
+        pass  # 极端情况：连写入都失败就放弃
+
+
 def _global_exception_handler(exc_type, exc_value, exc_tb) -> None:
     """
     全局未捕获异常处理。
