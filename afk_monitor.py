@@ -637,8 +637,8 @@ def main():
                         help=f"心跳间隔秒数（默认: {HEARTBEAT_INTERVAL}）")
     parser.add_argument("--heartbeat-timeout", type=int, default=HEARTBEAT_TIMEOUT,
                         help=f"心跳超时秒数（默认: {HEARTBEAT_TIMEOUT}）")
-    parser.add_argument("--check-server", action="store_true", default=False,
-                        help="启用服务器连接断开检测")
+    parser.add_argument("--no-check-server", action="store_true", default=False,
+                        help="禁用服务器连接断开检测（默认启用）")
     parser.add_argument("--server-check-interval", type=int, default=10,
                         help="服务器连接检测间隔秒数（默认: 10）")
 
@@ -728,10 +728,10 @@ def main():
         for ip, port in all_c:
             log.info(f"    - {ip}:{port}")
     log.info("-" * 40)
-    if args.check_server:
-        log.info(f"服务器连接检测已启用 (间隔: {args.server_check_interval}s)")
+    if args.no_check_server:
+        log.info("服务器连接检测已禁用 (使用 --no-check-server 禁用)")
     else:
-        log.info("服务器连接检测未启用 (使用 --check-server 启用)")
+        log.info(f"服务器连接检测已启用 (间隔: {args.server_check_interval}s)")
     log.info("")
 
     # ========== 回调函数 ==========
@@ -773,8 +773,8 @@ def main():
 
     peer.start()
 
-    # ========== 服务器连接监控（可选）==========
-    if args.check_server:
+    # ========== 服务器连接监控（默认启用）==========
+    if not args.no_check_server:
         def server_monitor(pid, interval, peer_obj, cb):
             log.info(f"[服务器检测] 监控线程已启动 (PID: {pid}, 间隔: {interval}s)")
             while peer_obj.running:
