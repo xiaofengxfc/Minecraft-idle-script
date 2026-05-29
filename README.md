@@ -358,11 +358,13 @@ python afk_monitor.py --instance a --restart-command "start mc_a.bat"
 ```
 挂机脚本/
 ├── afk_monitor.py          # 核心脚本（主程序）
+├── error_logger.py         # 全局报错日志模块
 ├── config.json             # 集中配置文件
 ├── start_instance_a.bat    # 实例 A 启动脚本（Windows）
 ├── start_instance_b.bat    # 实例 B 启动脚本（Windows）
 ├── requirements.txt        # Python 依赖列表
 ├── test_afk_monitor.py     # 单元测试
+├── logs/                   # 报错日志输出目录（自动创建）
 ├── .gitignore              # Git 忽略规则
 ├── 使用说明.txt            # 中文使用说明（纯文本）
 └── README.md               # 本文件
@@ -373,12 +375,14 @@ python afk_monitor.py --instance a --restart-command "start mc_a.bat"
 | 文件 | 说明 |
 |------|------|
 | `afk_monitor.py` | 主程序，包含 TCP 心跳、进程监控、服务器连接检测、配置管理等全部功能 |
+| `error_logger.py` | 全局报错日志模块，捕获未处理异常并记录进程/线程快照 |
 | `config.json` | 集中配置文件，管理心跳参数、端口、实例预设、Webhook 等 |
 | `start_instance_a.bat` | 实例 A 一键启动脚本，自动使用 `--instance a --auto` |
 | `start_instance_b.bat` | 实例 B 一键启动脚本，自动使用 `--instance b --auto` |
 | `requirements.txt` | Python 依赖（`psutil>=5.9.0`） |
 | `test_afk_monitor.py` | 单元测试和集成测试 |
-| `.gitignore` | 排除 `__pycache__`、`.pyc`、`*.log`、`config.local.json` 等 |
+| `logs/` | 报错日志输出目录（自动创建，保留最近 20 个文件） |
+| `.gitignore` | 排除 `__pycache__`、`.pyc`、`*.log`、`logs/`、`config.local.json` 等 |
 
 ### 核心类与模块
 
@@ -389,6 +393,59 @@ python afk_monitor.py --instance a --restart-command "start mc_a.bat"
 | `PeerConnection` | 对等连接管理器（TCP 服务端/客户端、双向心跳、掉线判定） |
 | `ServerConnectionMonitor` | 服务器连接监控（psutil + netstat 回退） |
 | `MonitorApp` | 主应用程序（流程编排、信号处理、回调注册） |
+
+---
+
+## 全局报错日志
+
+`error_logger.py` 提供一套完整的全局异常捕获和诊断日志系统，在脚本发生任何未处理异常时自动记录详细信息，便于排查问题。
+
+### 核心功能
+
+- **全局异常捕获**：通过 `sys.excepthook` 捕获主线程未处理异常，通过 `threading.excepthook`（Python 3.8+）捕获子线程未处理异常
+- **自动日志文件管理**：在 `logs/` 目录下创建带时间戳的报错日志文件（如 `error_20250101_120000.log`），自动清理保留最近 20 个
+- **进程/线程快照**：异常发生时自动记录当前进程 CPU/内存使用、活跃线程列表、系统内存状态
+- **与 afk_monitor 日志集成**：`afk_monitor.py` 中的 `log.error()` 等调用会同步写入报错日志文件
+- **优雅关闭**：脚本退出时自动恢复原始异常钩子，写入关闭标记
+
+### 日志写入方式
+
+| 写入方式 | 说明 |
+|----------|------|
+| 全局异常捕获 | 任何未被 `try/except` 捕获的异常自动写入 |
+| `write_error_to_log()` | 手动向报错日志写入一条消息（用于被捕获但仍需记录的致命错误） |
+| logging 集成 | `logging.getLogger("afk_monitor")` 的 FileHandler 自动同步 |
+
+### 日志文件格式
+
+```
+============================================================
+[2025-01-01 12:00:00] [INFO] 报错日志系统已初始化
+  Python 版本: 3.12.0
+  平台: win32
+  工作目录: D:\Minecraft-idle-script
+  脚本目录: D:\Minecraft-idle-script
+============================================================
+
+...（运行日志）...
+
+============================================================
+[2025-01-01 12:30:15] [CRITICAL] 未捕获的异常
+============================================================
+Traceback (most recent call last):
+  ...
+============================================================
+
+[2025-01-01 12:30:15] [DEBUG] 系统快照:
+  当前进程 PID: 12345, 名称: python.exe
+  CPU 使用率: 2.3%
+  内存使用: RSS=45.2MB, VMS=120.5MB
+  活跃线程数: 8
+    - MainThread (Alive, NonDaemon)
+    - ServerThread (Alive, Daemon)
+    ...
+  系统内存: 总量=16.0GB, 可用=8.2GB, 使用率=48.8%
+```
 
 ---
 
@@ -496,6 +553,7 @@ python afk_monitor.py --instance a --restart-command "start mc_a.bat"
 - ✨ psutil 自动安装
 - ✨ 宽泛 MC 进程识别
 - ✨ 接收缓冲区溢出防护
+- ✨ 全局报错日志系统（`error_logger.py`）：未处理异常自动捕获、进程/线程快照、自动清理
 - ✨ 完整单元测试覆盖
 
 ---
